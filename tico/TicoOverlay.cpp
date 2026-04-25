@@ -478,7 +478,7 @@ void TicoOverlay::RenderSocialArea(ImDrawList *dl, ImVec2 displaySize) {
 void TicoOverlay::RenderGame(ImDrawList *dl, ImVec2 displaySize, unsigned int texture,
                              float aspectRatio, int width, int height, int fboWidth, int fboHeight) {
     if (texture == 0) return;
-    static constexpr int CORE_BASE_W = 320, CORE_BASE_H = 240;
+    static constexpr int CORE_BASE_W = 256, CORE_BASE_H = 224;
     float dstWidth = displaySize.x, dstHeight = displaySize.y, offsetX = 0, offsetY = 0;
     if (m_displayMode == GambatteDisplayMode::Integer) {
         int scale;
@@ -508,11 +508,25 @@ void TicoOverlay::RenderGame(ImDrawList *dl, ImVec2 displaySize, unsigned int te
             else { dstHeight = displaySize.y; dstWidth = displaySize.y*aspectRatio; } break;
         }}
     }
-    offsetX = (displaySize.x - dstWidth) / 2.0f; offsetY = (displaySize.y - dstHeight) / 2.0f;
+    
+    // Ensure all dimensions are floored to integers to avoid fractional rendering fringes
+    dstWidth = std::floor(dstWidth);
+    dstHeight = std::floor(dstHeight);
+    offsetX = std::floor((displaySize.x - dstWidth) / 2.0f); 
+    offsetY = std::floor((displaySize.y - dstHeight) / 2.0f);
     dl->AddRectFilled(ImVec2(0,0), displaySize, IM_COL32(0,0,0,255));
     float u_max = (fboWidth > 0 && width > 0) ? (float)width/fboWidth : 1.0f;
     float v_max = (fboHeight > 0 && height > 0) ? (float)height/fboHeight : 1.0f;
-    dl->AddImage((ImTextureID)(intptr_t)texture, ImVec2(offsetX,offsetY), ImVec2(offsetX+dstWidth,offsetY+dstHeight), ImVec2(0,0), ImVec2(u_max,v_max));
+    
+    // Inset UV boundaries by 0.5 texel to completely eliminate any remaining OpenGL edge boundary drift artifacts
+    float half_u = (fboWidth > 0) ? 0.5f / fboWidth : 0.0f;
+    float half_v = (fboHeight > 0) ? 0.5f / fboHeight : 0.0f;
+    
+    dl->AddImage((ImTextureID)(intptr_t)texture, 
+                 ImVec2(offsetX, offsetY), 
+                 ImVec2(offsetX + dstWidth, offsetY + dstHeight), 
+                 ImVec2(half_u, half_v), 
+                 ImVec2(u_max - half_u, v_max - half_v));
 }
 
 void TicoOverlay::RenderOverlayBackground(ImDrawList *dl, ImVec2 displaySize) {
