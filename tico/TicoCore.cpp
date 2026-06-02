@@ -963,42 +963,10 @@ void TicoCore::RunFrame()
     // Process pending badge texture uploads (must happen on GL thread)
     ProcessPendingBadgeUploads();
 
-    if (m_isRewinding)
-    {
-        if (!m_rewindBuffer.empty())
-        {
-            auto& state = m_rewindBuffer.back();
-            retro_unserialize(state.data(), state.size());
-            m_rewindBuffer.pop_back();
-        }
-        retro_run();
-    }
-    else
-    {
-        m_rewindFrameCounter++;
-        if (m_rewindFrameCounter >= 2) // Save state every 2 frames for smoother rewind
-        {
-            m_rewindFrameCounter = 0;
-            size_t size = retro_serialize_size();
-            if (size > 0 && size < 1024 * 1024 * 15) // Sanity check to not allocate gigabytes (states should be small)
-            {
-                std::vector<uint8_t> state(size);
-                if (retro_serialize(state.data(), size))
-                {
-                    m_rewindBuffer.push_back(std::move(state));
-                    // Keep up to 5 seconds of rewind history (60fps / 2 * 5 = 150 states)
-                    if (m_rewindBuffer.size() > 150)
-                    {
-                        m_rewindBuffer.erase(m_rewindBuffer.begin());
-                    }
-                }
-            }
-        }
-        retro_run();
-        
-        if (m_rcClient && m_gameLoaded) {
-            rc_client_do_frame(m_rcClient);
-        }
+    retro_run();
+
+    if (m_rcClient && m_gameLoaded) {
+        rc_client_do_frame(m_rcClient);
     }
 
     // Unbind core's FBO so subsequent rendering targets the default framebuffer
