@@ -8,9 +8,16 @@ namespace TicoConfig {
     constexpr const char* TEST_ROM = "sdmc:/tico/roms/snes/rom.sfc";
 
     constexpr const char* FONT_PATH = "romfs:/fonts/font.ttf";
-    constexpr const char* SYSTEM_PATH = "sdmc:/tico/system/snes/";
-    constexpr const char* SAVES_PATH = "sdmc:/tico/saves/snes/";
-    constexpr const char* STATES_PATH = "sdmc:/tico/states/snes/";
+    /// Content directories for this console. Tico's per-module Paths tab stores
+    /// custom roots as tico_{system,saves,states}_path in snes9x.jsonc; like
+    /// Tico's own {saves}/{states}/{system}, the console slug is appended to the
+    /// root. Empty or missing keys fall back to sdmc:/tico/<kind>/snes/.
+    std::string SystemPath();
+    std::string SavesPath();
+    std::string StatesPath();
+
+    /// Create a directory and any missing parents.
+    void MakeDirs(const std::string &path);
 
     constexpr int WINDOW_WIDTH = 1280;
     constexpr int WINDOW_HEIGHT = 720;
