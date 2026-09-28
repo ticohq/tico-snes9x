@@ -131,6 +131,31 @@ TICO_C_SOURCES=(
     "$TICO_DIR/glad.c"
 )
 
+# Upstream leaves libretro-common's VFS/file_stream code out of static builds
+# (STATIC_LINKING) because RetroArch provides it. Tico is the frontend here,
+# so it has to supply these symbols itself.
+LRC_DIR="$ROOT_DIR/libretro/libretro-common"
+LRC_SOURCES=(
+    "$LRC_DIR/compat/compat_posix_string.c"
+    "$LRC_DIR/compat/compat_strcasestr.c"
+    "$LRC_DIR/compat/compat_snprintf.c"
+    "$LRC_DIR/compat/compat_strl.c"
+    "$LRC_DIR/compat/fopen_utf8.c"
+    "$LRC_DIR/encodings/encoding_utf.c"
+    "$LRC_DIR/encodings/encoding_deflate.c"
+    "$LRC_DIR/file/file_path.c"
+    "$LRC_DIR/file/file_path_io.c"
+    "$LRC_DIR/file/retro_dirent.c"
+    "$LRC_DIR/streams/file_stream.c"
+    "$LRC_DIR/streams/file_stream_transforms.c"
+    "$LRC_DIR/string/stdstring.c"
+    "$LRC_DIR/time/rtime.c"
+    "$LRC_DIR/vfs/vfs_implementation.c"
+)
+LRC_FLAGS="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE -O2 -g"
+LRC_FLAGS="$LRC_FLAGS -ffunction-sections -fdata-sections -D__SWITCH__ -DHAVE_LIBNX"
+LRC_FLAGS="$LRC_FLAGS -I$LIBNX/include -I$PORTLIBS/include -I$LRC_DIR/include -I$ROOT_DIR/libretro"
+
 # ImGui sources
 IMGUI_DIR="$TICO_DIR/deps/imgui"
 IMGUI_SOURCES=(
@@ -168,6 +193,18 @@ for src in "${TICO_C_SOURCES[@]}"; do
     obj="$BUILD_DIR/$(basename ${src%.c}.o)"
     echo "  CC  $src"
     $CC $COMMON_FLAGS -std=gnu11 -c "$src" -o "$obj"
+    if [ $? -ne 0 ]; then
+        echo "Error compiling $src"
+        exit 1
+    fi
+    TICO_OBJS+=("$obj")
+done
+
+# Compile libretro-common sources
+for src in "${LRC_SOURCES[@]}"; do
+    obj="$BUILD_DIR/lrc_$(basename ${src%.c}.o)"
+    echo "  CC  $src"
+    $CC $LRC_FLAGS -std=gnu11 -c "$src" -o "$obj"
     if [ $? -ne 0 ]; then
         echo "Error compiling $src"
         exit 1
