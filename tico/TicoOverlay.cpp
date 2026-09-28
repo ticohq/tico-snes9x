@@ -42,9 +42,8 @@ static std::string GetStatePath(TicoCore *core, int slot)
     if (lastSlash != std::string::npos) romName = romName.substr(lastSlash + 1);
     size_t lastDot = romName.find_last_of(".");
     if (lastDot != std::string::npos) romName = romName.substr(0, lastDot);
-    struct stat st = {0};
-    if (stat(TicoConfig::STATES_PATH, &st) == -1) mkdir(TicoConfig::STATES_PATH, 0777);
-    return std::string(TicoConfig::STATES_PATH) + romName + ".state" + std::to_string(slot);
+    TicoConfig::MakeDirs(TicoConfig::StatesPath());
+    return TicoConfig::StatesPath() + romName + ".state" + std::to_string(slot);
 }
 
 namespace UIStyle {
