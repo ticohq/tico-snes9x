@@ -2,6 +2,7 @@
 /// @brief Entry point for tico-integrated snes9x NRO
 /// Sets up SDL/EGL/ImGui and runs the main loop
 
+#include <cmath>
 #include "TicoCore.h"
 #include "TicoOverlay.h"
 #include "TicoConfig.h"
@@ -656,6 +657,32 @@ void HandleInput()
     }
 }
 
+// The display refreshes at 60 Hz and vsync paces the loop, so the core's own
+// frame rate has to be mapped onto that. Content near 60 Hz (NTSC, 60.10 fps)
+// runs one core frame per vsync, with audio stretched to absorb the small
+// difference. Anything else (PAL, 50.007 fps) is paced by an accumulator so it
+// runs at real speed instead of 60/50 = 120%.
+static constexpr double DISPLAY_HZ = 60.0;
+static double g_pacedFps = 0.0;
+static double g_frameStep = 1.0;
+static double g_frameAccum = 0.0;
+
+static void UpdateFramePacing()
+{
+    double fps = g_core->GetFPS();
+    if (fps <= 0.0 || fps == g_pacedFps)
+        return;
+
+    g_pacedFps = fps;
+    double effectiveFps = std::fabs(fps - DISPLAY_HZ) < 1.0 ? DISPLAY_HZ : fps;
+    g_frameStep = effectiveFps / DISPLAY_HZ;
+    g_frameAccum = 0.0;
+
+    g_audio.SetCoreSampleRate(g_core->GetSampleRate() * (effectiveFps / fps));
+    LOG_INFO("AUDIO", "Core %.3f fps, %.0f Hz: running %.3f core frames per vsync",
+             fps, g_core->GetSampleRate(), g_frameStep);
+}
+
 void Render()
 {
     static int frameCount = 0;
@@ -695,7 +722,13 @@ void Render()
             {
                 LOG_DEBUG("RENDER", "Frame %d: Calling RunFrame", frameCount);
             }
-            g_core->RunFrame();
+            UpdateFramePacing();
+            g_frameAccum += g_frameStep;
+            while (g_frameAccum >= 1.0)
+            {
+                g_frameAccum -= 1.0;
+                g_core->RunFrame();
+            }
             if (frameCount <= 3)
             {
                 LOG_DEBUG("RENDER", "Frame %d: RunFrame returned", frameCount);
@@ -897,9 +930,7 @@ int main(int argc, char *argv[])
     }
     else
     {
-        double adjusted_sample_rate = g_core->GetSampleRate() * (60.0 / g_core->GetFPS());
-        g_audio.SetCoreSampleRate(adjusted_sample_rate);
-        LOG_INFO("AUDIO", "Configured audio pipeline for %.0f Hz core output (Stretched to match 60Hz)", g_core->GetSampleRate());
+        UpdateFramePacing();
         g_core->InitShaderPipeline();
     }
 
