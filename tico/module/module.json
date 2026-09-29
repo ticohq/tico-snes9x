@@ -1,0 +1,32 @@
+{
+  "id": "snes9x",
+  "name": "Snes9x",
+  "nro": "tico-snes9x.nro",
+  "launch": "\"{nro}\" \"{rom}\" \"{title}\"",
+  "settings": "config/modules/snes9x/settings.json",
+  "config_file": "snes9x.jsonc",
+  "is_libretro": true,
+  "systems": [
+    {
+      "slug": "snes",
+      "title": "Super Nintendo",
+      "short_title": "SNES",
+      "extensions": [
+        ".sfc",
+        ".smc",
+        ".fig",
+        ".swc",
+        ".bs",
+        ".st"
+      ],
+      "games_file": "snes.json",
+      "retroachievements_id": 3,
+      "colors": {
+        "start": "E65FA0",
+        "end": "7A7AE6",
+        "start_dark": "A84473",
+        "end_dark": "5757A8"
+      }
+    }
+  ]
+}

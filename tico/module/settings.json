@@ -1,0 +1,360 @@
+{
+  "core_id": "snes9x",
+  "display_name": "Snes9x",
+  "config_file": "snes9x.jsonc",
+  "slugs": [
+    "snes"
+  ],
+  "tabs": [
+    {
+      "name": "settings_snes9x_tab_system",
+      "sections": [
+        {
+          "title": "settings_snes9x_section_region",
+          "options": [
+            {
+              "key": "snes9x_region",
+              "label": "settings_snes9x_console_region",
+              "type": "enum",
+              "default": "auto",
+              "choices": [
+                {
+                  "label": "Auto",
+                  "value": "auto"
+                },
+                {
+                  "label": "NTSC",
+                  "value": "ntsc"
+                },
+                {
+                  "label": "PAL",
+                  "value": "pal"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "settings_snes9x_section_input",
+          "options": [
+            {
+              "key": "snes9x_up_down_allowed",
+              "label": "settings_snes9x_opposing_directions",
+              "type": "bool",
+              "default": "disabled"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "settings_snes9x_tab_video",
+      "sections": [
+        {
+          "title": "settings_snes9x_section_display",
+          "options": [
+            {
+              "key": "snes9x_aspect",
+              "label": "settings_snes9x_aspect_ratio",
+              "type": "enum",
+              "default": "4:3",
+              "choices": [
+                {
+                  "label": "4:3",
+                  "value": "4:3"
+                },
+                {
+                  "label": "4:3 (Preserved)",
+                  "value": "4:3 scaled"
+                },
+                {
+                  "label": "Uncorrected",
+                  "value": "uncorrected"
+                },
+                {
+                  "label": "Auto",
+                  "value": "auto"
+                },
+                {
+                  "label": "NTSC",
+                  "value": "ntsc"
+                },
+                {
+                  "label": "PAL",
+                  "value": "pal"
+                }
+              ]
+            },
+            {
+              "key": "snes9x_overscan",
+              "label": "settings_snes9x_crop_overscan",
+              "type": "enum",
+              "default": "enabled",
+              "choices": [
+                {
+                  "label": "~8 Pixels",
+                  "value": "enabled"
+                },
+                {
+                  "label": "12 Pixels",
+                  "value": "12_pixels"
+                },
+                {
+                  "label": "16 Pixels",
+                  "value": "16_pixels"
+                },
+                {
+                  "label": "Auto (~8 Pixels)",
+                  "value": "auto"
+                },
+                {
+                  "label": "Disabled",
+                  "value": "disabled"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "settings_snes9x_section_filters",
+          "options": [
+            {
+              "key": "snes9x_hires_blend",
+              "label": "settings_snes9x_hi_res_blending",
+              "type": "enum",
+              "default": "disabled",
+              "choices": [
+                {
+                  "label": "Disabled",
+                  "value": "disabled"
+                },
+                {
+                  "label": "Merge",
+                  "value": "merge"
+                },
+                {
+                  "label": "Blur",
+                  "value": "blur"
+                }
+              ]
+            },
+            {
+              "key": "snes9x_blargg",
+              "label": "settings_snes9x_blargg_ntsc_filter",
+              "type": "enum",
+              "default": "disabled",
+              "choices": [
+                {
+                  "label": "Disabled",
+                  "value": "disabled"
+                },
+                {
+                  "label": "Monochrome",
+                  "value": "monochrome"
+                },
+                {
+                  "label": "RF",
+                  "value": "rf"
+                },
+                {
+                  "label": "Composite",
+                  "value": "composite"
+                },
+                {
+                  "label": "S-Video",
+                  "value": "s-video"
+                },
+                {
+                  "label": "RGB",
+                  "value": "rgb"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "settings_snes9x_section_rendering",
+          "options": [
+            {
+              "key": "snes9x_gfx_clip",
+              "label": "settings_snes9x_graphic_clip_windows",
+              "type": "bool",
+              "default": "enabled"
+            },
+            {
+              "key": "snes9x_gfx_transp",
+              "label": "settings_snes9x_transparency_effects",
+              "type": "bool",
+              "default": "enabled"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "settings_snes9x_tab_audio",
+      "sections": [
+        {
+          "title": "settings_snes9x_section_quality",
+          "options": [
+            {
+              "key": "snes9x_audio_interpolation",
+              "label": "settings_snes9x_interpolation",
+              "type": "enum",
+              "default": "gaussian",
+              "choices": [
+                {
+                  "label": "Gaussian",
+                  "value": "gaussian"
+                },
+                {
+                  "label": "Cubic",
+                  "value": "cubic"
+                },
+                {
+                  "label": "Sinc",
+                  "value": "sinc"
+                },
+                {
+                  "label": "None",
+                  "value": "none"
+                },
+                {
+                  "label": "Linear",
+                  "value": "linear"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "settings_snes9x_tab_hacks",
+      "sections": [
+        {
+          "title": "settings_snes9x_section_performance",
+          "options": [
+            {
+              "key": "snes9x_overclock_superfx",
+              "label": "settings_snes9x_superfx_overclock",
+              "type": "enum",
+              "default": "100%",
+              "choices": [
+                {
+                  "label": "50%",
+                  "value": "50%"
+                },
+                {
+                  "label": "60%",
+                  "value": "60%"
+                },
+                {
+                  "label": "70%",
+                  "value": "70%"
+                },
+                {
+                  "label": "80%",
+                  "value": "80%"
+                },
+                {
+                  "label": "90%",
+                  "value": "90%"
+                },
+                {
+                  "label": "100%",
+                  "value": "100%"
+                },
+                {
+                  "label": "150%",
+                  "value": "150%"
+                },
+                {
+                  "label": "200%",
+                  "value": "200%"
+                },
+                {
+                  "label": "250%",
+                  "value": "250%"
+                },
+                {
+                  "label": "300%",
+                  "value": "300%"
+                },
+                {
+                  "label": "350%",
+                  "value": "350%"
+                },
+                {
+                  "label": "400%",
+                  "value": "400%"
+                },
+                {
+                  "label": "450%",
+                  "value": "450%"
+                },
+                {
+                  "label": "500%",
+                  "value": "500%"
+                }
+              ]
+            },
+            {
+              "key": "snes9x_overclock_cycles",
+              "label": "settings_snes9x_reduce_slowdown",
+              "type": "enum",
+              "default": "disabled",
+              "choices": [
+                {
+                  "label": "Disabled",
+                  "value": "disabled"
+                },
+                {
+                  "label": "Light",
+                  "value": "light"
+                },
+                {
+                  "label": "Compatible",
+                  "value": "compatible"
+                },
+                {
+                  "label": "Max",
+                  "value": "max"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "settings_snes9x_section_compatibility",
+          "options": [
+            {
+              "key": "snes9x_reduce_sprite_flicker",
+              "label": "settings_snes9x_reduce_flickering",
+              "type": "bool",
+              "default": "disabled"
+            },
+            {
+              "key": "snes9x_randomize_memory",
+              "label": "settings_snes9x_randomize_ram",
+              "type": "bool",
+              "default": "disabled"
+            },
+            {
+              "key": "snes9x_block_invalid_vram_access",
+              "label": "settings_snes9x_block_invalid_vram",
+              "type": "bool",
+              "default": "enabled"
+            },
+            {
+              "key": "snes9x_echo_buffer_hack",
+              "label": "settings_snes9x_echo_buffer_hack",
+              "type": "bool",
+              "default": "disabled"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
