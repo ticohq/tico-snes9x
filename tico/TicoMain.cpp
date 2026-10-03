@@ -1,6 +1,6 @@
 /// @file TicoMain.cpp
 /// @brief Entry point for tico-integrated snes9x NRO
-/// Sets up SDL/EGL/ImGui and runs the main loop
+/// Sets up SDL/Vulkan/ImGui and runs the main loop
 
 #include <cmath>
 #include "TicoCore.h"
@@ -8,6 +8,8 @@
 #include "TicoConfig.h"
 #include "TicoAudio.h"
 #include "TicoTranslationManager.h"
+#include "TicoShaderChain.h"
+#include "TicoVulkan.h"
 
 #include <SDL.h>
 #include <memory>
@@ -21,18 +23,16 @@
 #ifdef __SWITCH__
 #include <switch.h>
 #include <curl/curl.h>
-#include "glad.h"
-#include <EGL/egl.h>
 #endif
 
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
-#include "imgui_impl_opengl3.h"
 
 //==============================================================================
 // NX System Configuration (extern "C")
 //==============================================================================
 
+#ifdef __SWITCH__
 extern "C" {
 u32 __NvOptimusEnablement = 1;
 u32 __NvDeveloperOption = 1;
@@ -40,20 +40,17 @@ u32 __nx_applet_type = AppletType_Application;
 u32 __nx_applet_exit_mode = 0; // 0 = standard exit (return to Homebrew ABI loader if NRO). 1 = forceful applet exit
 size_t __nx_heap_size = 0;
 }
+#endif
 
 //==============================================================================
 // Globals
 //==============================================================================
 
 static SDL_Window *g_window = nullptr;
-#ifndef __SWITCH__
-static SDL_GLContext g_glContext = nullptr;
-#endif
-static EGLDisplay g_eglDisplay = EGL_NO_DISPLAY;
-static EGLContext g_eglContext = EGL_NO_CONTEXT;
-static EGLSurface g_eglSurface = EGL_NO_SURFACE;
 
 static std::unique_ptr<TicoCore> g_core;
+static std::unique_ptr<TicoShaderChain> g_chain;
+static std::string g_activePreset = "\x01"; // forces the first load
 static std::unique_ptr<TicoOverlay> g_overlay;
 
 static bool g_running = true;
@@ -102,21 +99,16 @@ static bool UpdateScreenMode()
     if (operationMode == g_lastOperationMode)
         return false;
 
-    if (operationMode == AppletOperationMode_Handheld)
-    {
-        nwindowSetCrop(nwindowGetDefault(), 0, 360, 1280, 1080);
-        LOG_INFO("DISPLAY", "Mode → Handheld (1280×720 crop)");
-        if (ImGui::GetCurrentContext()) {
-            ImGui::GetIO().FontGlobalScale = 1.0f;
-        }
-    }
-    else
-    {
-        nwindowSetCrop(nwindowGetDefault(), 0, 0, 1920, 1080);
-        LOG_INFO("DISPLAY", "Mode → Docked (1920×1080)");
-        if (ImGui::GetCurrentContext()) {
-            ImGui::GetIO().FontGlobalScale = 1.5f;
-        }
+    // Size the window to the mode and crop from the top-left, as tico-dolphin
+    // does, so the swapchain always matches what is on screen.
+    const bool handheld = operationMode == AppletOperationMode_Handheld;
+    const u32 w = handheld ? 1280 : 1920, h = handheld ? 720 : 1080;
+    nwindowSetDimensions(nwindowGetDefault(), w, h);
+    nwindowSetCrop(nwindowGetDefault(), 0, 0, w, h);
+    TicoVulkan::Resize(w, h);
+    LOG_INFO("DISPLAY", "Mode → %s (%ux%u)", handheld ? "Handheld" : "Docked", w, h);
+    if (ImGui::GetCurrentContext()) {
+        ImGui::GetIO().FontGlobalScale = handheld ? 1.0f : 1.5f;
     }
     g_lastOperationMode = operationMode;
     return true;
@@ -162,6 +154,7 @@ static void RefreshControllers()
     }
 
     g_controllersDirty = false;
+    LOG_INFO("HOME", "Controllers: %d joystick(s), %d opened", joystickCount, controllerIndex);
 }
 
 static void GetDisplayResolution(int &w, int &h)
@@ -179,7 +172,14 @@ static void GetDisplayResolution(int &w, int &h)
         h = 1080;
     }
 #else
-    if (g_window)
+    uint32_t sw = 0, sh = 0;
+    TicoVulkan::GetSwapExtent(sw, sh);
+    if (sw && sh)
+    {
+        w = (int)sw;
+        h = (int)sh;
+    }
+    else if (g_window)
         SDL_GetWindowSize(g_window, &w, &h);
     else
     {
@@ -210,116 +210,17 @@ bool InitWindow()
     GetDisplayResolution(w, h);
     LOG_INFO("HOME", "Switch Resolution: %dx%d (logical)", w, h);
 
-    // Initialize EGL
-    g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (g_eglDisplay == EGL_NO_DISPLAY)
-    {
-        LOG_ERROR("EGL", "eglGetDisplay failed");
-        return false;
-    }
-
-    EGLint major, minor;
-    if (!eglInitialize(g_eglDisplay, &major, &minor))
-    {
-        LOG_ERROR("EGL", "eglInitialize failed");
-        return false;
-    }
-    LOG_INFO("EGL", "EGL %d.%d initialized", major, minor);
-
-    EGLConfig config;
-    EGLint numConfigs;
-    const EGLint configAttribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 24,
-        EGL_STENCIL_SIZE, 8,
-        EGL_NONE};
-
-    if (!eglChooseConfig(g_eglDisplay, configAttribs, &config, 1, &numConfigs))
-    {
-        LOG_ERROR("EGL", "eglChooseConfig failed");
-        return false;
-    }
-
-    g_eglSurface = eglCreateWindowSurface(g_eglDisplay, config,
-                                          nwindowGetDefault(), NULL);
-    if (g_eglSurface == EGL_NO_SURFACE)
-    {
-        LOG_ERROR("EGL", "eglCreateWindowSurface failed");
-        return false;
-    }
-
-    eglBindAPI(EGL_OPENGL_API);
-    const EGLint contextAttribs[] = {
-        EGL_CONTEXT_MAJOR_VERSION, 4,
-        EGL_CONTEXT_MINOR_VERSION, 3,
-        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-        EGL_NONE};
-
-    g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
-    if (g_eglContext == EGL_NO_CONTEXT)
-    {
-        LOG_ERROR("EGL", "eglCreateContext failed");
-        return false;
-    }
-
-    if (!eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext))
-    {
-        LOG_ERROR("EGL", "eglMakeCurrent failed");
-        return false;
-    }
-
-    if (!gladLoadGLLoader((GLADloadproc)eglGetProcAddress))
-    {
-        LOG_ERROR("HOME", "gladLoadGLLoader failed");
-        return false;
-    }
-
-    eglSwapInterval(g_eglDisplay, 1);
-    LOG_INFO("EGL", "VSync enabled (eglSwapInterval=1) — swap is the sole frame governor");
-
-    LOG_INFO("HOME", "OpenGL %s initialized", glGetString(GL_VERSION));
-
 #else
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-
     g_window = SDL_CreateWindow("snes9x",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 TicoConfig::WINDOW_WIDTH, TicoConfig::WINDOW_HEIGHT,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN);
 
     if (!g_window)
     {
         LOG_ERROR("HOME", "SDL_CreateWindow failed: %s", SDL_GetError());
         return false;
     }
-
-    g_glContext = SDL_GL_CreateContext(g_window);
-    if (!g_glContext)
-    {
-        LOG_ERROR("HOME", "SDL_GL_CreateContext failed: %s", SDL_GetError());
-        return false;
-    }
-
-    SDL_GL_MakeCurrent(g_window, g_glContext);
-    SDL_GL_SetSwapInterval(1);
-
-    if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress))
-    {
-        LOG_ERROR("HOME", "gladLoadGLLoader failed");
-        return false;
-    }
-
-    LOG_INFO("HOME", "OpenGL %s initialized", glGetString(GL_VERSION));
 #endif
 
     if (TicoConfig::USE_SDLQUEUEAUDIO)
@@ -367,6 +268,13 @@ static size_t AudioSampleBatchCallback(const int16_t *data, size_t frames)
     return g_audio.PushSamples(data, frames);
 }
 
+static void VideoCallback(const void *data, unsigned width, unsigned height, size_t pitch,
+                          retro_pixel_format format)
+{
+    if (g_chain)
+        g_chain->SetSourceFrame(data, width, height, pitch, format);
+}
+
 static void AudioFlushCallback()
 {
     g_audio.Flush();
@@ -384,13 +292,18 @@ bool InitImGui()
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     LOG_INFO("HOME", "ImGui context created");
 
-#ifdef __SWITCH__
-    ImGui_ImplSDL2_InitForOpenGL(g_window, nullptr);
-    ImGui_ImplOpenGL3_Init("#version 430 core");
-#else
-    ImGui_ImplSDL2_InitForOpenGL(g_window, g_glContext);
-    ImGui_ImplOpenGL3_Init("#version 330 core");
+    // Switch has no SDL window and the overlay reads the pads itself, so the
+    // SDL platform backend is desktop-only.
+#ifndef __SWITCH__
+    ImGui_ImplSDL2_InitForVulkan(g_window);
 #endif
+    int w, h;
+    GetDisplayResolution(w, h);
+    if (!TicoVulkan::Init(g_window, (uint32_t)w, (uint32_t)h))
+    {
+        LOG_ERROR("HOME", "Vulkan initialization failed");
+        return false;
+    }
     LOG_INFO("HOME", "ImGui backends initialized");
 
 #ifdef __SWITCH__
@@ -413,13 +326,13 @@ bool InitImGui()
     // Load secondary font for RA alert descriptions
     io.Fonts->AddFontFromFileTTF("romfs:/fonts/description.ttf", TicoConfig::FONT_SIZE * 0.75f);
 #else
-    if (!io.Fonts->AddFontFromFileTTF("assets/fonts/font.ttf", TicoConfig::FONT_SIZE))
+    if (!io.Fonts->AddFontFromFileTTF("tico/fonts/font.ttf", TicoConfig::FONT_SIZE))
     {
-        LOG_ERROR("HOME", "Failed to load ImGui font from assets/fonts/font.ttf");
+        LOG_ERROR("HOME", "Failed to load ImGui font from tico/fonts/font.ttf");
         return false;
     }
     // Load secondary font for RA alert descriptions
-    io.Fonts->AddFontFromFileTTF("assets/fonts/description.ttf", TicoConfig::FONT_SIZE * 0.75f);
+    io.Fonts->AddFontFromFileTTF("tico/fonts/description.ttf", TicoConfig::FONT_SIZE * 0.75f);
 #endif
 
     LOG_INFO("HOME", "ImGui initialized");
@@ -430,34 +343,13 @@ void CleanupWindow()
 {
     CloseControllers();
 
-    glFinish();
-
-    ImGui_ImplOpenGL3_Shutdown();
+    g_chain.reset();
+    TicoSlang::Shutdown();
+    TicoVulkan::Shutdown();
+#ifndef __SWITCH__
     ImGui_ImplSDL2_Shutdown();
-    ImGui::DestroyContext();
-
-#ifdef __SWITCH__
-    if (g_eglContext != EGL_NO_CONTEXT)
-    {
-        eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroyContext(g_eglDisplay, g_eglContext);
-    }
-    if (g_eglSurface != EGL_NO_SURFACE)
-    {
-        eglDestroySurface(g_eglDisplay, g_eglSurface);
-    }
-    if (g_eglDisplay != EGL_NO_DISPLAY)
-    {
-        eglTerminate(g_eglDisplay);
-    }
-
-    eglReleaseThread();
-#else
-    if (g_glContext)
-    {
-        SDL_GL_DeleteContext(g_glContext);
-    }
 #endif
+    ImGui::DestroyContext();
 
     if (g_window)
     {
@@ -476,7 +368,9 @@ void ProcessEvents()
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
+#ifndef __SWITCH__
         ImGui_ImplSDL2_ProcessEvent(&event);
+#endif
 
         if (event.type == SDL_QUIT)
         {
@@ -502,8 +396,65 @@ void ProcessEvents()
     }
 }
 
+#ifndef __SWITCH__
+// Desktop debug: TICO_INPUT="frame:button,frame:button,..." drives a virtual
+// gamepad, pressing each SDL button name (a, b, dpup, guide, ...) for a few
+// frames starting at that frame. Lets the overlay be exercised without a pad.
+static void RunInputScript(int frame)
+{
+    static SDL_Joystick *pad = nullptr;
+    static std::vector<std::pair<int, SDL_GameControllerButton>> script;
+    static bool parsed = false;
+    if (!parsed)
+    {
+        parsed = true;
+        const char *spec = getenv("TICO_INPUT");
+        if (!spec)
+            return;
+        std::string s = spec;
+        size_t pos = 0;
+        while (pos < s.size())
+        {
+            size_t comma = s.find(',', pos);
+            std::string item = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            size_t colon = item.find(':');
+            if (colon != std::string::npos)
+                script.push_back({atoi(item.substr(0, colon).c_str()),
+                                  SDL_GameControllerGetButtonFromString(item.substr(colon + 1).c_str())});
+            if (comma == std::string::npos)
+                break;
+            pos = comma + 1;
+        }
+        SDL_VirtualJoystickDesc desc;
+        SDL_zero(desc);
+        desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+        desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+        desc.naxes = SDL_CONTROLLER_AXIS_MAX;
+        desc.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
+        desc.name = "tico script pad";
+        int index = SDL_JoystickAttachVirtualEx(&desc);
+        pad = index >= 0 ? SDL_JoystickOpen(index) : nullptr;
+        LOG_INFO("HOME", "Script pad: index %d, open %s, controller %d (%s)", index, pad ? "yes" : "no",
+                 index >= 0 ? SDL_IsGameController(index) : -1, SDL_GetError());
+    }
+    if (!pad)
+        return;
+    for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++)
+    {
+        bool down = false;
+        for (const auto &step : script)
+            down |= step.second == b && frame >= step.first && frame < step.first + 4;
+        SDL_JoystickSetVirtualButton(pad, b, down ? 1 : 0);
+    }
+}
+#endif
+
 void HandleInput()
 {
+#ifndef __SWITCH__
+    static int inputFrame = 0;
+    RunInputScript(++inputFrame);
+#endif
     SDL_GameController *controllers[4] = {nullptr, nullptr, nullptr, nullptr};
     int numControllers = 0;
 
@@ -693,11 +644,16 @@ void Render()
         LOG_DEBUG("RENDER", "Frame %d: Render starting", frameCount);
     }
 
-    ImGui_ImplOpenGL3_NewFrame();
-
 #ifdef __SWITCH__
     UpdateScreenMode();
+#endif
 
+    // Waits for this frame slot's previous submission, so everything below
+    // may reuse per-frame resources. A skipped frame (swapchain being
+    // recreated) still runs the core so emulation keeps its pace.
+    VkCommandBuffer cmd = TicoVulkan::BeginFrame();
+
+#ifdef __SWITCH__
     ImGuiIO &io = ImGui::GetIO();
     int logW, logH;
     GetDisplayResolution(logW, logH);
@@ -705,6 +661,10 @@ void Render()
     io.DeltaTime = 1.0f / 60.0f;
 #else
     ImGui_ImplSDL2_NewFrame();
+    int logW, logH;
+    GetDisplayResolution(logW, logH);
+    ImGui::GetIO().DisplaySize = ImVec2((float)logW, (float)logH);
+    ImGui::GetIO().DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 #endif
     ImGui::NewFrame();
 
@@ -736,28 +696,54 @@ void Render()
         }
     }
 
-    glViewport(0, 0, w, h);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
     if (g_overlay)
     {
-        unsigned int tex = g_core ? g_core->GetFrameTextureID() : 0;
-        float ar = g_core ? g_core->GetAspectRatio() : 4.0f / 3.0f;
-        int fw = g_core ? g_core->GetFrameWidth() : 640;
-        int fh = g_core ? g_core->GetFrameHeight() : 480;
-        int fboW = g_core ? g_core->GetFBOWidth() : 0;
-        int fboH = g_core ? g_core->GetFBOHeight() : 0;
-
-        g_overlay->Render(displaySize, tex, ar, fw, fh, fboW, fboH);
-
-        // Sync shader selection from overlay to core
-        if (g_core && g_overlay)
+        // Apply a shader change made in the overlay.
+        std::string wanted = g_overlay->GetShaderPreset();
+#ifndef __SWITCH__
+        if (const char *forced = getenv("TICO_SHADER"))
+            wanted = forced;
+#endif
+        if (g_chain && wanted != g_activePreset)
         {
-            ShaderType desired = static_cast<ShaderType>(g_overlay->GetShaderSelection());
-            if (desired != g_core->GetShader())
-                g_core->SetShader(desired);
+            // Compiling a preset can take a while on the Switch, so the frame
+            // before it shows a message instead of the screen just freezing.
+            static std::string announced;
+            if (announced != wanted && !wanted.empty() && g_core)
+            {
+                announced = wanted;
+                g_core->ShowOSD(tr("emulator_loading_shader"), 2);
+            }
+            else
+            {
+                announced.clear();
+                std::string error;
+                if (g_chain->LoadPreset(wanted, error))
+                {
+                    g_activePreset = wanted;
+                    g_overlay->OnShaderLoaded();
+                }
+                else
+                {
+                    LOG_ERROR("SHADER", "Cannot load %s: %s", wanted.c_str(), error.c_str());
+                    std::string firstLine = error.substr(0, error.find('\n'));
+                    if (g_core)
+                        g_core->ShowOSD(tr("emulator_shader_failed") + ": " + firstLine.substr(0, 80), 300);
+                    // Keep showing (and saving) what actually runs.
+                    g_overlay->SetShaderPreset(g_activePreset == "\x01" ? "" : g_activePreset);
+                    if (g_activePreset == "\x01")
+                        g_activePreset.clear();
+                }
+            }
         }
+
+        float ar = g_core ? g_core->GetAspectRatio() : 4.0f / 3.0f;
+        ImVec4 rect = g_overlay->ComputeGameRect(displaySize, ar);
+        ImTextureID tex = ImTextureID_Invalid;
+        if (g_chain && cmd && rect.z >= 1.0f && rect.w >= 1.0f)
+            tex = g_chain->Process(cmd, (uint32_t)rect.z, (uint32_t)rect.w, ar,
+                                   g_core ? g_core->GetFPS() : 60.0);
+        g_overlay->Render(displaySize, tex, rect);
     }
     
     if (g_core && g_core->GetOSDFrames() > 0)
@@ -791,12 +777,29 @@ void Render()
     }
 
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (cmd)
+        TicoVulkan::EndFrame(ImGui::GetDrawData());
 
-#ifdef __SWITCH__
-    eglSwapBuffers(g_eglDisplay, g_eglSurface);
-#else
-    SDL_GL_SwapWindow(g_window);
+#ifndef __SWITCH__
+    // Debug: TICO_SCREENSHOT_FRAME=N saves frame N, overlay included, to
+    // TICO_SCREENSHOT_PATH (captured by the next EndFrame).
+    static const char *shotFrame = getenv("TICO_SCREENSHOT_FRAME");
+    if (shotFrame && frameCount + 1 == atoi(shotFrame))
+    {
+        const char *path = getenv("TICO_SCREENSHOT_PATH");
+        TicoVulkan::RequestScreenshot(path ? path : "tico-screenshot.png");
+    }
+
+    // Debug hook for testing shaders on the desktop: TICO_DUMP_FRAME=N saves
+    // the shader chain's output after N frames to TICO_DUMP_PATH and quits.
+    static const char *dumpFrame = getenv("TICO_DUMP_FRAME");
+    if (dumpFrame && g_chain && frameCount == atoi(dumpFrame))
+    {
+        const char *path = getenv("TICO_DUMP_PATH");
+        bool ok = g_chain->SaveOutputPNG(path ? path : "tico-frame.png");
+        LOG_INFO("RENDER", "Frame dump %s", ok ? "written" : "failed");
+        g_running = false;
+    }
 #endif
 }
 
@@ -860,14 +863,6 @@ int main(int argc, char *argv[])
     PinCurrentThreadToCore(2, "main/render");
 #endif
 
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-#ifdef __SWITCH__
-    eglSwapBuffers(g_eglDisplay, g_eglSurface);
-#else
-    SDL_GL_SwapWindow(g_window);
-#endif
-
     LOG_INFO("HOME", "Calling InitImGui...");
     if (!InitImGui())
     {
@@ -877,6 +872,13 @@ int main(int argc, char *argv[])
         return 1;
     }
     LOG_INFO("HOME", "InitImGui succeeded");
+
+    g_chain = std::make_unique<TicoShaderChain>();
+    if (!g_chain->Init())
+    {
+        LOG_ERROR("HOME", "Shader chain initialization failed");
+        g_chain.reset();
+    }
 #ifdef __SWITCH__
     g_lastOperationMode = 255;
 #endif
@@ -887,8 +889,10 @@ int main(int argc, char *argv[])
     LOG_INFO("HOME", "Creating overlay...");
     g_overlay = std::make_unique<TicoOverlay>();
     g_overlay->SetCore(g_core.get());
+    g_overlay->SetShaderChain(g_chain.get());
 
     g_core->SetAudioCallbacks(AudioSampleCallback, AudioSampleBatchCallback, AudioFlushCallback);
+    g_core->SetVideoCallback(VideoCallback);
 
     if (!g_audio.Init(g_audioDevice))
     {
@@ -931,14 +935,13 @@ int main(int argc, char *argv[])
     else
     {
         UpdateFramePacing();
-        g_core->InitShaderPipeline();
     }
 
     Uint32 lastTime = SDL_GetTicks();
 
-    // Frame pacing is handled entirely by vsync (eglSwapBuffers with
-    // eglSwapInterval=1). Audio is non-blocking, so the swap is the only governor.
-    // While fast-forwarding we drop to swapInterval=0 so the loop is uncapped.
+    // Frame pacing is handled entirely by vsync (FIFO presentation). Audio is
+    // non-blocking, so presentation is the only governor. While fast-forwarding
+    // the swapchain switches to an uncapped present mode.
     bool lastFastForward = false;
 
     while (g_running)
@@ -955,12 +958,7 @@ int main(int argc, char *argv[])
         bool fastForward = g_audio.IsFastForwarding();
         if (fastForward != lastFastForward)
         {
-            int interval = fastForward ? 0 : 1;
-#ifdef __SWITCH__
-            eglSwapInterval(g_eglDisplay, interval);
-#else
-            SDL_GL_SetSwapInterval(interval);
-#endif
+            TicoVulkan::SetVsync(!fastForward);
             lastFastForward = fastForward;
         }
 
@@ -978,6 +976,7 @@ int main(int argc, char *argv[])
     }
 
     LOG_INFO("HOME", "Starting cleanup...");
+    TicoVulkan::WaitIdle();
     g_overlay.reset();
     g_core.reset();
 

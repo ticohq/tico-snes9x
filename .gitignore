@@ -506,3 +506,9 @@ profile
 
 # tico
 build_tico
+build_glslang_nx/
+build_desktop/
+/shaders
+/cache/
+tico/config/
+/imgui.ini

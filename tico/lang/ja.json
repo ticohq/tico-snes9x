@@ -22,5 +22,12 @@
     "emulator_original": "オリジナル",
     "emulator_no_discs": "ディスクが見つかりません",
     "launcher_error_game_not_found": "ゲームが見つかりません",
-    "emulator_shader": "シェーダー"
+    "emulator_shader": "シェーダー",
+    "emulator_shader_parameters": "シェーダー設定",
+    "emulator_no_parameters": "なし",
+    "emulator_reset_parameters": "初期値に戻す",
+    "emulator_builtin_shaders": "内蔵",
+    "emulator_no_shaders": "slangプリセットを sdmc:/tico/shaders/ にコピーしてください",
+    "emulator_loading_shader": "シェーダーを読み込み中...",
+    "emulator_shader_failed": "シェーダーを読み込めませんでした"
 }

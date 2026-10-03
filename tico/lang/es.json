@@ -22,5 +22,12 @@
     "emulator_original": "Original",
     "emulator_no_discs": "No hay discos",
     "launcher_error_game_not_found": "Juego no encontrado",
-    "emulator_shader": "Shader"
+    "emulator_shader": "Shader",
+    "emulator_shader_parameters": "Parámetros del shader",
+    "emulator_no_parameters": "Ninguno",
+    "emulator_reset_parameters": "Restablecer valores",
+    "emulator_builtin_shaders": "Integrados",
+    "emulator_no_shaders": "Copia presets slang a sdmc:/tico/shaders/",
+    "emulator_loading_shader": "Cargando shader...",
+    "emulator_shader_failed": "No se pudo cargar el shader"
 }
