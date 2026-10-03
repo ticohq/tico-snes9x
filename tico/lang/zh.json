@@ -22,5 +22,12 @@
     "emulator_original": "原始",
     "emulator_no_discs": "未找到光盘",
     "launcher_error_game_not_found": "未找到游戏",
-    "emulator_shader": "着色器"
+    "emulator_shader": "着色器",
+    "emulator_shader_parameters": "着色器参数",
+    "emulator_no_parameters": "无",
+    "emulator_reset_parameters": "恢复默认值",
+    "emulator_builtin_shaders": "内置",
+    "emulator_no_shaders": "请将 slang 预设复制到 sdmc:/tico/shaders/",
+    "emulator_loading_shader": "正在加载着色器...",
+    "emulator_shader_failed": "着色器加载失败"
 }

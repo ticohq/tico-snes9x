@@ -41,7 +41,11 @@ bool TicoTranslationManager::Init() {
     else if (language == "Chinese") filename = "zh.json";
     else filename = "en.json";
 
+#ifdef __SWITCH__
     std::string langPath = "romfs:/lang/" + filename;
+#else
+    std::string langPath = "tico/lang/" + filename;
+#endif
     std::ifstream file(langPath);
     if (!file.is_open()) {
         return false;

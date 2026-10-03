@@ -22,5 +22,12 @@
     "emulator_original": "Original",
     "emulator_no_discs": "Nenhum disco encontrado",
     "launcher_error_game_not_found": "Jogo Não Encontrado",
-    "emulator_shader": "Filtro"
+    "emulator_shader": "Filtro",
+    "emulator_shader_parameters": "Parâmetros do filtro",
+    "emulator_no_parameters": "Nenhum",
+    "emulator_reset_parameters": "Restaurar padrões",
+    "emulator_builtin_shaders": "Integrados",
+    "emulator_no_shaders": "Copie presets slang para sdmc:/tico/shaders/",
+    "emulator_loading_shader": "Carregando filtro...",
+    "emulator_shader_failed": "Falha ao carregar o filtro"
 }

@@ -6,9 +6,11 @@
 #include <SDL.h>
 #include <string>
 #include <vector>
+#include <map>
 #include <memory>
 
 class TicoCore;
+class TicoShaderChain;
 
 /// @brief Overlay menu types
 enum class OverlayMenu
@@ -16,7 +18,9 @@ enum class OverlayMenu
     None,
     QuickMenu,
     SaveStates,
-    Settings
+    Settings,
+    ShaderBrowser,
+    ShaderParams
 };
 
 /// @brief Display mode for the emulator viewport
@@ -49,9 +53,12 @@ public:
     /// @brief Update overlay animation
     void Update(float deltaTime);
 
-    /// @brief Render the overlay
-    void Render(ImVec2 displaySize, unsigned int gameTexture, float aspectRatio,
-                int frameWidth, int frameHeight, int fboWidth = 0, int fboHeight = 0);
+    /// @brief Where the game goes on screen (x, y, width, height), in whole
+    /// pixels, from the display mode and size settings.
+    ImVec4 ComputeGameRect(ImVec2 displaySize, float aspectRatio) const;
+
+    /// @brief Render the overlay; `gameTexture` fills `gameRect` 1:1
+    void Render(ImVec2 displaySize, ImTextureID gameTexture, ImVec4 gameRect);
 
     /// @brief Handle input
     /// @return true if input was consumed by overlay
@@ -76,22 +83,32 @@ public:
     bool ShouldExit() const { return m_shouldExit; }
     void ClearExit() { m_shouldExit = false; }
 
-    /// @brief Shader selection accessor
-    int GetShaderSelection() const { return m_shaderSelection; }
+    /// @brief Selected slang preset path ("" = none)
+    const std::string &GetShaderPreset() const { return m_shaderPreset; }
+    /// @brief Put the selection back, e.g. after the preset failed to load
+    void SetShaderPreset(const std::string &path) { m_shaderPreset = path; }
+
+    /// @brief The chain whose parameters the Shader Parameters menu edits
+    void SetShaderChain(TicoShaderChain *chain) { m_chain = chain; }
+    /// @brief Apply the saved parameter values after the main loop loads a preset
+    void OnShaderLoaded();
 
     /// @brief Check if user wants to reset
     bool ShouldReset() const { return m_shouldReset; }
     void ClearReset() { m_shouldReset = false; }
 
 private:
-    void RenderGame(ImDrawList *dl, ImVec2 displaySize, unsigned int texture,
-                    float aspectRatio, int width, int height,
-                    int fboWidth, int fboHeight);
+    void RenderGame(ImDrawList *dl, ImVec2 displaySize, ImTextureID texture, ImVec4 rect);
     void RenderOverlayBackground(ImDrawList *dl, ImVec2 displaySize);
     void RenderTitleCard(ImDrawList *dl, ImVec2 displaySize);
     void RenderQuickMenu(ImDrawList *dl, ImVec2 displaySize);
     void RenderSaveStatesMenu(ImDrawList *dl, ImVec2 displaySize);
     void RenderSettingsMenu(ImDrawList *dl, ImVec2 displaySize);
+    void RenderShaderBrowser(ImDrawList *dl, ImVec2 displaySize);
+    void RenderShaderParams(ImDrawList *dl, ImVec2 displaySize);
+    struct ListRow { std::string label, value; };
+    void RenderScrollList(ImDrawList *dl, ImVec2 displaySize, const std::string &title,
+                          const std::vector<ListRow> &rows, int selection, int &scroll, bool arrows);
     void RenderHelpersBar(ImDrawList *dl, ImVec2 displaySize);
     void RenderStatusBar(ImDrawList *dl, ImVec2 displaySize);
     void RenderRAAlerts(ImDrawList *dl, ImVec2 displaySize, float deltaTime);
@@ -106,7 +123,30 @@ private:
     int m_saveStateSlot = 0;
     bool m_isSaveMode = true;
     int m_settingsSelection = 0;
-    int m_shaderSelection = 0; // 0=None, 1=LCD, 2=Scale2x
+    std::string m_shaderPreset; // "" = none
+    std::vector<std::string> m_shaderPresets; // "" first, then built-ins, then SD
+    void ScanShaderPresets();
+    void CycleShaderPreset(int dir);
+    std::string ShaderPresetLabel() const;
+
+    // Shader browser: folders and .slangp files under the user shader dir.
+    struct BrowseEntry { std::string label, path; bool isDir; };
+    std::vector<BrowseEntry> m_browseEntries;
+    std::string m_browseDir;
+    int m_browseSel = 0;
+    int m_browseScroll = 0;
+    void OpenShaderBrowser(const std::string &dir);
+    void ActivateBrowseEntry();
+
+    // Shader parameters, saved per preset (only values off their default).
+    TicoShaderChain *m_chain = nullptr;
+    std::map<std::string, std::map<std::string, float>> m_shaderParams;
+    int m_paramSel = 0;
+    int m_paramScroll = 0;
+    bool m_paramsDirty = false;
+    void AdjustShaderParam(int dir);
+    void ResetShaderParams();
+    void LeaveShaderParams();
     
     GambatteDisplayMode m_displayMode = GambatteDisplayMode::Display;
     GambatteDisplaySize m_displaySize = GambatteDisplaySize::_4_3;
@@ -115,9 +155,6 @@ private:
     void SaveCoreSettings();
     void ApplyScalingSettings(bool save = true);
 
-    unsigned int m_triangleTexture = 0;
-    int m_triangleWidth = 0;
-    int m_triangleHeight = 0;
 
     bool m_upHeld = false;
     bool m_downHeld = false;
@@ -138,7 +175,7 @@ private:
     bool m_isCharging = false;
     float m_batteryTimer = 0.0f;
     float m_chargingStateProgress = 0.0f;
-    unsigned int m_boltTexture = 0;
+    ImTextureID m_boltTexture = ImTextureID_Invalid;
     int m_boltWidth = 0;
     int m_boltHeight = 0;
 
@@ -149,7 +186,7 @@ private:
     void LoadGeneralConfig();
     void LoadSVGIcon();
 
-    unsigned int m_avatarTexture = 0;
+    ImTextureID m_avatarTexture = ImTextureID_Invalid;
     std::string m_nickname;
     void LoadAccountData();
     void RenderSocialArea(ImDrawList *dl, ImVec2 displaySize);

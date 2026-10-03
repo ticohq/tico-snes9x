@@ -12,11 +12,11 @@
 #include "TicoUtils.h"
 #include <json.hpp>
 
-#ifdef __SWITCH__
-#include "glad.h"
-#else
-#include "glad.h"
-#endif
+#include "TicoShaderChain.h"
+#include "TicoVulkan.h"
+#include <cstdio>
+#include <cstring>
+#include <strings.h>
 
 #include <sys/stat.h>
 #include <dirent.h>
@@ -33,6 +33,14 @@
 #define NANOSVGRAST_IMPLEMENTATION
 #include "deps/nanosvg/nanosvgrast.h"
 
+#ifdef __SWITCH__
+static const char *kBuiltinShaderDir = "romfs:/shaders/";
+static const char *kUserShaderDir = "sdmc:/tico/shaders/";
+#else
+static const char *kBuiltinShaderDir = "tico/shaders/";
+static const char *kUserShaderDir = "shaders/";
+#endif
+
 static std::string GetStatePath(TicoCore *core, int slot)
 {
     if (!core) return "";
@@ -46,7 +54,108 @@ static std::string GetStatePath(TicoCore *core, int slot)
     return TicoConfig::StatesPath() + romName + ".state" + std::to_string(slot);
 }
 
+// Selection border, as tico-nx draws it: a 512x4 gradient strip scrolled
+// around the rounded outline. The strip follows the user's Screen Colors >
+// Animated Border pick (display.jsonc "border_tint"); these files and their
+// index mapping mirror tico-nx's TintPalette::GetBorderGradientFile.
+#ifdef __SWITCH__
+static const char *kBorderDir = "romfs:/assets/border/";
+#else
+static const char *kBorderDir = "tico/assets/border/";
+#endif
+static ImTextureID s_borderTexture = ImTextureID_Invalid;
+static int s_borderTint = -2;
+
+static std::string BorderGradientFile(int tint) {
+    static const char *kSlugs[] = {"default", "aqua", "violet", "sunset", "lime", "rose", "gold",
+                                   "ice", "ember", "mint", "lagoon", "cobalt", "original"};
+    const int count = (int)(sizeof(kSlugs) / sizeof(kSlugs[0]));
+    const int original = count - 1;
+    if (tint <= 0 || tint >= count || tint == original) return "border_gradient.png";
+    return std::string("border_gradient_") + kSlugs[tint] + ".png";
+}
+
+static void LoadBorderTexture(int tint) {
+    if (tint == s_borderTint) return;
+    s_borderTint = tint;
+    TicoVulkan::DestroyTexture(s_borderTexture);
+    s_borderTexture = ImTextureID_Invalid;
+    int w, h, ch;
+    std::string path = kBorderDir + BorderGradientFile(tint);
+    if (unsigned char *px = stbi_load(path.c_str(), &w, &h, &ch, 4)) {
+        s_borderTexture = TicoVulkan::CreateTextureRGBA(px, w, h);
+        stbi_image_free(px);
+    }
+}
+
 namespace UIStyle {
+    // Port of tico-nx UIStyle::DrawAnimatedGradientBorder (textured path).
+    inline void DrawAnimatedGradientBorder(ImDrawList *dl, ImVec2 min, ImVec2 max, float cornerRadius,
+                                           float frameWidth, float alpha, float time, ImTextureID texture) {
+        float phase = time * 0.5f;
+        float phaseMod = phase - floorf(phase);
+        float w = max.x - min.x, h = max.y - min.y;
+        cornerRadius = std::min(cornerRadius, std::min(w, h) * 0.5f);
+        float perimeter = 2.0f * (w + h - 4.0f * cornerRadius) + 2.0f * 3.14159f * cornerRadius;
+        struct BorderPoint { ImVec2 pos, normal; float dist; };
+        ImVector<BorderPoint> points;
+        points.reserve(64);
+        float currentDist = 0.0f;
+        auto addPoint = [&](ImVec2 pos, ImVec2 normal) {
+            if (points.Size > 0) {
+                float dx = pos.x - points.back().pos.x, dy = pos.y - points.back().pos.y;
+                currentDist += sqrtf(dx * dx + dy * dy);
+            }
+            points.push_back({pos, normal, currentDist / perimeter});
+        };
+        ImVec2 centers[4] = {ImVec2(min.x + cornerRadius, min.y + cornerRadius), ImVec2(max.x - cornerRadius, min.y + cornerRadius),
+                             ImVec2(max.x - cornerRadius, max.y - cornerRadius), ImVec2(min.x + cornerRadius, max.y - cornerRadius)};
+        const int segs = 12;
+        for (int c = 0; c < 4; c++) {
+            float start = -3.14159f + c * 1.5708f;
+            for (int i = 0; i <= segs; i++) {
+                float a = start + 1.5708f * i / segs;
+                addPoint(ImVec2(centers[c].x + cosf(a) * cornerRadius, centers[c].y + sinf(a) * cornerRadius), ImVec2(cosf(a), sinf(a)));
+            }
+        }
+        ImU32 tint = IM_COL32(255, 255, 255, (int)(255 * alpha));
+        float halfW = frameWidth * 0.5f;
+        auto lerp2 = [](const ImVec2 &a, const ImVec2 &b, float t) { return ImVec2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t); };
+        for (int i = 0; i < points.Size; i++) {
+            int next = (i + 1) % points.Size;
+            const BorderPoint &p1 = points[i], &p2 = points[next];
+            ImVec2 v1o(p1.pos.x + p1.normal.x * halfW, p1.pos.y + p1.normal.y * halfW), v1i(p1.pos.x - p1.normal.x * halfW, p1.pos.y - p1.normal.y * halfW);
+            ImVec2 v2o(p2.pos.x + p2.normal.x * halfW, p2.pos.y + p2.normal.y * halfW), v2i(p2.pos.x - p2.normal.x * halfW, p2.pos.y - p2.normal.y * halfW);
+            float u1 = p1.dist + phaseMod, u2 = (next == 0 ? 1.0f : p2.dist) + phaseMod;
+            // Keep UVs inside [0,1]: split a segment that crosses the wrap.
+            auto emit = [&](float t1, float t2, float us, float ue) {
+                dl->AddImageQuad(texture, lerp2(v1o, v2o, t1), lerp2(v1o, v2o, t2), lerp2(v1i, v2i, t2), lerp2(v1i, v2i, t1),
+                                 ImVec2(us, 0.0f), ImVec2(ue, 0.0f), ImVec2(ue, 1.0f), ImVec2(us, 1.0f), tint);
+            };
+            if (u1 < 1.0f && u2 > 1.0f) {
+                float ts = (1.0f - u1) / (u2 - u1);
+                emit(0.0f, ts, u1, 1.0f);
+                emit(ts, 1.0f, 0.0f, u2 - 1.0f);
+            } else {
+                if (u1 >= 1.0f) u1 -= 1.0f;
+                if (u2 >= 1.0f) u2 -= 1.0f;
+                emit(0.0f, 1.0f, u1, u2);
+            }
+        }
+    }
+
+    /// Highlight for the selected row of a menu.
+    inline void DrawSelection(ImDrawList *dl, ImVec2 itemMin, ImVec2 itemMax, float cornerRadius, float alpha, bool isDark) {
+        float scale = ImGui::GetIO().FontGlobalScale;
+        if (s_borderTexture != ImTextureID_Invalid) {
+            DrawAnimatedGradientBorder(dl, itemMin, itemMax, cornerRadius, 4.0f * scale,
+                                       alpha, (float)ImGui::GetTime(), s_borderTexture);
+        } else {
+            ImU32 selCol = isDark ? IM_COL32(60,60,60,(int)(255*alpha)) : IM_COL32(190,195,205,(int)(255*alpha));
+            dl->AddRectFilled(itemMin, itemMax, selCol, cornerRadius);
+        }
+    }
+
     inline void DrawTextWithShadow(ImDrawList *dl, ImVec2 pos, ImU32 color, const char *text, float shadowOffset = 1.5f) {
         dl->AddText(ImVec2(pos.x + shadowOffset, pos.y + shadowOffset), IM_COL32(0,0,0,50), text);
         dl->AddText(pos, color, text);
@@ -74,23 +183,11 @@ TicoOverlay::TicoOverlay() {
 
 TicoOverlay::~TicoOverlay()
 {
-    if (m_triangleTexture != 0)
-    {
-        glDeleteTextures(1, &m_triangleTexture);
-        m_triangleTexture = 0;
-    }
-
-    if (m_boltTexture != 0)
-    {
-        glDeleteTextures(1, &m_boltTexture);
-        m_boltTexture = 0;
-    }
-
-    if (m_avatarTexture != 0)
-    {
-        glDeleteTextures(1, &m_avatarTexture);
-        m_avatarTexture = 0;
-    }
+    TicoVulkan::DestroyTexture(s_borderTexture);
+    s_borderTexture = ImTextureID_Invalid;
+    s_borderTint = -2;
+    TicoVulkan::DestroyTexture(m_boltTexture);
+    TicoVulkan::DestroyTexture(m_avatarTexture);
 
 #ifdef __SWITCH__
     psmExit();
@@ -100,6 +197,7 @@ TicoOverlay::~TicoOverlay()
 void TicoOverlay::LoadConfig() {
     const char *configPaths[] = {"sdmc:/tiicu/config/display.jsonc","sdmc:/tico/config/display.jsonc","tico/config/display.jsonc"};
     m_isDarkMode = true; m_showNickname = false;
+    int borderTint = 0;
     FILE *fp = nullptr;
     for (const char *path : configPaths) { fp = fopen(path, "rb"); if (fp) break; }
     if (fp) {
@@ -111,11 +209,13 @@ void TicoOverlay::LoadConfig() {
                     if (j.contains("dark_mode") && j["dark_mode"].is_boolean()) m_isDarkMode = j["dark_mode"].get<bool>();
                     else if (j.contains("darkMode") && j["darkMode"].is_boolean()) m_isDarkMode = j["darkMode"].get<bool>();
                     if (j.contains("show_nickname") && j["show_nickname"].is_boolean()) m_showNickname = j["show_nickname"].get<bool>();
+                    if (j.contains("border_tint") && j["border_tint"].is_number_integer()) borderTint = j["border_tint"].get<int>();
                     else if (j.contains("showNickname") && j["showNickname"].is_boolean()) m_showNickname = j["showNickname"].get<bool>();
                 }
         }
         fclose(fp);
     }
+    LoadBorderTexture(borderTint);
 }
 
 void TicoOverlay::LoadGeneralConfig() {
@@ -144,12 +244,9 @@ void TicoOverlay::LoadAccountData() {
         int width, height, channels;
         unsigned char *data = stbi_load(path, &width, &height, &channels, 4);
         if (data) {
-            if (m_avatarTexture != 0) glDeleteTextures(1, &m_avatarTexture);
-            glGenTextures(1, &m_avatarTexture); glBindTexture(GL_TEXTURE_2D, m_avatarTexture);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-            glBindTexture(GL_TEXTURE_2D, 0); stbi_image_free(data);
+            TicoVulkan::DestroyTexture(m_avatarTexture);
+            m_avatarTexture = TicoVulkan::CreateTextureRGBA(data, width, height);
+            stbi_image_free(data);
             m_nickname = "Player 1"; customAvatarLoaded = true; break;
         }
     }
@@ -179,12 +276,9 @@ void TicoOverlay::LoadAccountData() {
                         int width, height, channels;
                         unsigned char *rgba = stbi_load_from_memory(jpegBuf, actualSize, &width, &height, &channels, 4);
                         if (rgba) {
-                            if (m_avatarTexture != 0) glDeleteTextures(1, &m_avatarTexture);
-                            glGenTextures(1, &m_avatarTexture); glBindTexture(GL_TEXTURE_2D, m_avatarTexture);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-                            glBindTexture(GL_TEXTURE_2D, 0); stbi_image_free(rgba);
+                            TicoVulkan::DestroyTexture(m_avatarTexture);
+                            m_avatarTexture = TicoVulkan::CreateTextureRGBA(rgba, width, height);
+                            stbi_image_free(rgba);
                         }
                     }
                     free(jpegBuf);
@@ -230,11 +324,10 @@ void TicoOverlay::Show() {
 
 void TicoOverlay::Hide() { m_currentMenu = OverlayMenu::None; }
 
-void TicoOverlay::Render(ImVec2 displaySize, unsigned int gameTexture, float aspectRatio,
-                         int frameWidth, int frameHeight, int fboWidth, int fboHeight) {
+void TicoOverlay::Render(ImVec2 displaySize, ImTextureID gameTexture, ImVec4 gameRect) {
     ImDrawList *bgDrawList = ImGui::GetBackgroundDrawList();
     ImDrawList *fgDrawList = ImGui::GetForegroundDrawList();
-    RenderGame(bgDrawList, displaySize, gameTexture, aspectRatio, frameWidth, frameHeight, fboWidth, fboHeight);
+    RenderGame(bgDrawList, displaySize, gameTexture, gameRect);
     if (m_currentMenu != OverlayMenu::None) {
         RenderOverlayBackground(fgDrawList, displaySize);
         RenderTitleCard(fgDrawList, displaySize);
@@ -242,6 +335,8 @@ void TicoOverlay::Render(ImVec2 displaySize, unsigned int gameTexture, float asp
         case OverlayMenu::QuickMenu: RenderQuickMenu(fgDrawList, displaySize); break;
         case OverlayMenu::SaveStates: RenderSaveStatesMenu(fgDrawList, displaySize); break;
         case OverlayMenu::Settings: RenderSettingsMenu(fgDrawList, displaySize); break;
+        case OverlayMenu::ShaderBrowser: RenderShaderBrowser(fgDrawList, displaySize); break;
+        case OverlayMenu::ShaderParams: RenderShaderParams(fgDrawList, displaySize); break;
         default: break;
         }
         RenderHelpersBar(fgDrawList, displaySize);
@@ -258,7 +353,7 @@ void TicoOverlay::RenderRAAlerts(ImDrawList *dl, ImVec2 displaySize, float delta
     if (notifications.empty()) return;
 
     // Lazy-load RA icon from SVG if not loaded yet
-    if (m_core->m_raIconTexture == 0) {
+    if (m_core->m_raIconTexture == ImTextureID_Invalid) {
         // Load ra.svg as texture using nanosvg (available in this TU)
         const char* svgPath = "romfs:/assets/ra.svg";
         NSVGimage* image = nsvgParseFromFile(svgPath, "px", 96);
@@ -270,14 +365,7 @@ void TicoOverlay::RenderRAAlerts(ImDrawList *dl, ImVec2 displaySize, float delta
                 unsigned char* img = (unsigned char*)malloc(w * h * 4);
                 if (img) {
                     nsvgRasterize(rast, image, 0, 0, sc, img, w, h, w * 4);
-                    unsigned int tex = 0;
-                    glGenTextures(1, &tex);
-                    glBindTexture(GL_TEXTURE_2D, tex);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
-                    glBindTexture(GL_TEXTURE_2D, 0);
-                    m_core->m_raIconTexture = tex;
+                    m_core->m_raIconTexture = TicoVulkan::CreateTextureRGBA(img, w, h);
                     free(img);
                 }
                 nsvgDeleteRasterizer(rast);
@@ -324,7 +412,7 @@ void TicoOverlay::RenderRAAlerts(ImDrawList *dl, ImVec2 displaySize, float delta
         auto& n = notifications[i];
 
         // Lazy-resolve badge texture (may have been downloaded after notification was pushed)
-        if (n.textureId == 0 && !n.badge_name.empty()) {
+        if (n.textureId == ImTextureID_Invalid && !n.badge_name.empty()) {
             if (n.badge_name == "ra_icon") {
                 n.textureId = m_core->m_raIconTexture;
             } else {
@@ -372,7 +460,7 @@ void TicoOverlay::RenderRAAlerts(ImDrawList *dl, ImVec2 displaySize, float delta
 
         // Badge image (left side)
         float textX = rectMin.x + padding;
-        if (n.textureId != 0) {
+        if (n.textureId != ImTextureID_Invalid) {
             float badgeX = rectMin.x + badgeMargin;
             float badgeY = rectMin.y + (alertH - badgeSize) * 0.5f;
 
@@ -390,7 +478,7 @@ void TicoOverlay::RenderRAAlerts(ImDrawList *dl, ImVec2 displaySize, float delta
             ImVec2 bMin(drawBadgeX, drawBadgeY);
             ImVec2 bMax(drawBadgeX + drawBadgeSize, drawBadgeY + drawBadgeSize);
             ImU32 imgCol = IM_COL32(255, 255, 255, alpha);
-            dl->AddImageRounded((ImTextureID)(uintptr_t)n.textureId,
+            dl->AddImageRounded(n.textureId,
                 bMin, bMax, ImVec2(0,0), ImVec2(1,1), imgCol, badgeRadius);
             
             textX = badgeX + badgeSize + badgeMargin;
@@ -464,7 +552,7 @@ void TicoOverlay::RenderSocialArea(ImDrawList *dl, ImVec2 displaySize) {
     dl->AddCircleFilled(avatarCenter, radius, baseCol);
     if (m_avatarTexture != 0) {
         float imgRadius = radius - 4.0f;
-        dl->AddImageRounded((ImTextureID)(intptr_t)m_avatarTexture,
+        dl->AddImageRounded(m_avatarTexture,
             ImVec2(avatarCenter.x-imgRadius, avatarCenter.y-imgRadius),
             ImVec2(avatarCenter.x+imgRadius, avatarCenter.y+imgRadius),
             ImVec2(0,0), ImVec2(1,1), IM_COL32_WHITE, imgRadius);
@@ -474,9 +562,7 @@ void TicoOverlay::RenderSocialArea(ImDrawList *dl, ImVec2 displaySize) {
     }
 }
 
-void TicoOverlay::RenderGame(ImDrawList *dl, ImVec2 displaySize, unsigned int texture,
-                             float aspectRatio, int width, int height, int fboWidth, int fboHeight) {
-    if (texture == 0) return;
+ImVec4 TicoOverlay::ComputeGameRect(ImVec2 displaySize, float aspectRatio) const {
     static constexpr int CORE_BASE_W = 256, CORE_BASE_H = 224;
     float dstWidth = displaySize.x, dstHeight = displaySize.y, offsetX = 0, offsetY = 0;
     if (m_displayMode == GambatteDisplayMode::Integer) {
@@ -513,19 +599,14 @@ void TicoOverlay::RenderGame(ImDrawList *dl, ImVec2 displaySize, unsigned int te
     dstHeight = std::floor(dstHeight);
     offsetX = std::floor((displaySize.x - dstWidth) / 2.0f); 
     offsetY = std::floor((displaySize.y - dstHeight) / 2.0f);
+    return ImVec4(offsetX, offsetY, dstWidth, dstHeight);
+}
+
+void TicoOverlay::RenderGame(ImDrawList *dl, ImVec2 displaySize, ImTextureID texture, ImVec4 rect) {
     dl->AddRectFilled(ImVec2(0,0), displaySize, IM_COL32(0,0,0,255));
-    float u_max = (fboWidth > 0 && width > 0) ? (float)width/fboWidth : 1.0f;
-    float v_max = (fboHeight > 0 && height > 0) ? (float)height/fboHeight : 1.0f;
-    
-    // Inset UV boundaries by 0.5 texel to completely eliminate any remaining OpenGL edge boundary drift artifacts
-    float half_u = (fboWidth > 0) ? 0.5f / fboWidth : 0.0f;
-    float half_v = (fboHeight > 0) ? 0.5f / fboHeight : 0.0f;
-    
-    dl->AddImage((ImTextureID)(intptr_t)texture, 
-                 ImVec2(offsetX, offsetY), 
-                 ImVec2(offsetX + dstWidth, offsetY + dstHeight), 
-                 ImVec2(half_u, half_v), 
-                 ImVec2(u_max - half_u, v_max - half_v));
+    if (texture == ImTextureID_Invalid) return;
+    // The shader chain rendered at exactly this size, so this is a 1:1 copy.
+    dl->AddImage(texture, ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.z, rect.y + rect.w));
 }
 
 void TicoOverlay::RenderOverlayBackground(ImDrawList *dl, ImVec2 displaySize) {
@@ -578,13 +659,7 @@ static void RenderMenuItem(ImDrawList *dl, ImVec2 menuPos, ImVec2 menuSize, int 
     float scale = ImGui::GetIO().FontGlobalScale;
     float itemY = menuPos.y + i * itemHeight;
     ImVec2 itemMin(menuPos.x, itemY), itemMax(menuPos.x + menuSize.x, itemY + itemHeight);
-    if (isSelected) {
-        ImDrawFlags corners = 0; float itemRadius = 0.0f;
-        if (i == 0) { corners = ImDrawFlags_RoundCornersTop; itemRadius = cornerRadius; }
-        else if (i == numItems - 1) { corners = ImDrawFlags_RoundCornersBottom; itemRadius = cornerRadius; }
-        ImU32 selCol = isDark ? IM_COL32(60,60,60,(int)(255*easeOut)) : IM_COL32(190,195,205,(int)(255*easeOut));
-        dl->AddRectFilled(itemMin, itemMax, selCol, itemRadius, corners);
-    }
+    if (isSelected) UIStyle::DrawSelection(dl, itemMin, itemMax, cornerRadius, easeOut, isDark);
     ImU32 textColor;
     if (isDark) textColor = isSelected ? IM_COL32(255,255,255,(int)(255*easeOut)) : IM_COL32(200,200,200,(int)(255*easeOut));
     else textColor = isSelected ? IM_COL32(60,60,70,(int)(255*easeOut)) : IM_COL32(90,90,100,(int)(255*easeOut));
@@ -619,21 +694,15 @@ void TicoOverlay::RenderSaveStatesMenu(ImDrawList *dl, ImVec2 displaySize) {
 
 void TicoOverlay::RenderSettingsMenu(ImDrawList *dl, ImVec2 displaySize) {
     float scale = ImGui::GetIO().FontGlobalScale;
-    const int N = 3; float itemH = 64.0f * scale;
+    const int N = 4; float itemH = 64.0f * scale;
     ImVec2 menuPos, menuSize; float easeOut, cornerRadius;
-    RenderMenuContainer(dl, displaySize, 400.0f*scale, N, itemH, m_animTimer, m_isDarkMode, menuPos, menuSize, easeOut, cornerRadius);
+    RenderMenuContainer(dl, displaySize, 480.0f*scale, N, itemH, m_animTimer, m_isDarkMode, menuPos, menuSize, easeOut, cornerRadius);
     ImFont *font = ImGui::GetFont(); float fs = ImGui::GetFontSize() * 0.85f;
     for (int i = 0; i < N; i++) {
         bool isSelected = (m_settingsSelection == i);
         float itemY = menuPos.y + i * itemH;
         ImVec2 itemMin(menuPos.x, itemY), itemMax(menuPos.x + menuSize.x, itemY + itemH);
-        if (isSelected) {
-            ImDrawFlags corners = 0; float itemRadius = 0.0f;
-            if (i == 0) { corners = ImDrawFlags_RoundCornersTop; itemRadius = cornerRadius; }
-            else if (i == N-1) { corners = ImDrawFlags_RoundCornersBottom; itemRadius = cornerRadius; }
-            ImU32 selCol = m_isDarkMode ? IM_COL32(60,60,60,(int)(255*easeOut)) : IM_COL32(190,195,205,(int)(255*easeOut));
-            dl->AddRectFilled(itemMin, itemMax, selCol, itemRadius, corners);
-        }
+        if (isSelected) UIStyle::DrawSelection(dl, itemMin, itemMax, cornerRadius, easeOut, m_isDarkMode);
         std::string label, value;
         if (i == 0) { label = tr("emulator_display_mode"); value = (m_displayMode == GambatteDisplayMode::Integer) ? tr("emulator_integer") : tr("emulator_display"); }
         else if (i == 1) {
@@ -645,8 +714,11 @@ void TicoOverlay::RenderSettingsMenu(ImDrawList *dl, ImVec2 displaySize) {
             }
         } else if (i == 2) {
             label = tr("emulator_shader");
-            const char *shaderNames[] = {"None", "xBRZ", "Eagle", "CRT Easy Mode"};
-            value = shaderNames[m_shaderSelection % 4];
+            value = ShaderPresetLabel();
+        } else if (i == 3) {
+            label = tr("emulator_shader_parameters");
+            size_t n = m_chain ? m_chain->Parameters().size() : 0;
+            value = n ? std::to_string(n) : tr("emulator_no_parameters");
         }
         ImU32 textColor;
         if (m_isDarkMode) textColor = isSelected ? IM_COL32(255,255,255,(int)(255*easeOut)) : IM_COL32(200,200,200,(int)(255*easeOut));
@@ -657,7 +729,7 @@ void TicoOverlay::RenderSettingsMenu(ImDrawList *dl, ImVec2 displaySize) {
         ImVec2 valueSize = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, value.c_str());
         float valueX = itemMax.x - valueSize.x - 40.0f * scale;
         dl->AddText(font, fs, ImVec2(valueX, itemMin.y + (itemH - labelSize.y)/2), textColor, value.c_str());
-        if (isSelected) {
+        if (isSelected && i < 3) {
             float arrowSize = 12.0f * scale, arrowY = itemMin.y + (itemH - arrowSize)/2;
             float lx = valueX - arrowSize - 12.0f*scale;
             dl->AddTriangleFilled(ImVec2(lx,arrowY+arrowSize/2), ImVec2(lx+arrowSize,arrowY), ImVec2(lx+arrowSize,arrowY+arrowSize), textColor);
@@ -676,7 +748,7 @@ void TicoOverlay::RenderHelpersBar(ImDrawList *dl, ImVec2 displaySize) {
     struct Helper { const char *btn; std::string desc; };
     std::vector<Helper> helpers;
     if (m_currentMenu == OverlayMenu::QuickMenu) helpers.push_back({"-", tr("emulator_reset")});
-    else if (m_currentMenu == OverlayMenu::Settings) helpers.push_back({"DPAD", tr("emulator_change")});
+    else if (m_currentMenu == OverlayMenu::Settings || m_currentMenu == OverlayMenu::ShaderParams) helpers.push_back({"DPAD", tr("emulator_change")});
     helpers.push_back({"B", tr("emulator_back")}); helpers.push_back({"A", tr("emulator_select")});
     float totalWidth = PADDING * 2;
     for (size_t i = 0; i < helpers.size(); i++) {
@@ -705,7 +777,10 @@ bool TicoOverlay::HandleInput(SDL_GameController *controller) {
     if (togglePressed && !m_toggleHeld && debounced) {
         m_toggleHeld = true; m_lastInputTime = now;
         if (m_currentMenu == OverlayMenu::None) Show();
-        else if (m_currentMenu == OverlayMenu::SaveStates || m_currentMenu == OverlayMenu::Settings) { m_currentMenu = OverlayMenu::QuickMenu; m_animTimer = 0.4f; }
+        else if (m_currentMenu != OverlayMenu::QuickMenu) {
+            if (m_currentMenu == OverlayMenu::ShaderParams) LeaveShaderParams();
+            m_currentMenu = OverlayMenu::QuickMenu; m_animTimer = 0.4f;
+        }
         else Hide();
         return true;
     }
@@ -729,14 +804,22 @@ bool TicoOverlay::HandleInput(SDL_GameController *controller) {
         m_upHeld = true; m_lastInputTime = now;
         if (m_currentMenu == OverlayMenu::QuickMenu) m_quickMenuSelection = (m_quickMenuSelection + 3) % 4;
         else if (m_currentMenu == OverlayMenu::SaveStates) m_saveStateSlot = (m_saveStateSlot + 3) % 4;
-        else if (m_currentMenu == OverlayMenu::Settings) m_settingsSelection = (m_settingsSelection + 2) % 3;
+        else if (m_currentMenu == OverlayMenu::Settings) m_settingsSelection = (m_settingsSelection + 3) % 4;
+        else if (m_currentMenu == OverlayMenu::ShaderBrowser && !m_browseEntries.empty())
+            m_browseSel = (m_browseSel + (int)m_browseEntries.size() - 1) % (int)m_browseEntries.size();
+        else if (m_currentMenu == OverlayMenu::ShaderParams && m_chain)
+            m_paramSel = (m_paramSel + (int)m_chain->Parameters().size()) % ((int)m_chain->Parameters().size() + 1);
     }
     if (!up) m_upHeld = false;
     if (down && !m_downHeld && debounced) {
         m_downHeld = true; m_lastInputTime = now;
         if (m_currentMenu == OverlayMenu::QuickMenu) m_quickMenuSelection = (m_quickMenuSelection + 1) % 4;
         else if (m_currentMenu == OverlayMenu::SaveStates) m_saveStateSlot = (m_saveStateSlot + 1) % 4;
-        else if (m_currentMenu == OverlayMenu::Settings) m_settingsSelection = (m_settingsSelection + 1) % 3;
+        else if (m_currentMenu == OverlayMenu::Settings) m_settingsSelection = (m_settingsSelection + 1) % 4;
+        else if (m_currentMenu == OverlayMenu::ShaderBrowser && !m_browseEntries.empty())
+            m_browseSel = (m_browseSel + 1) % (int)m_browseEntries.size();
+        else if (m_currentMenu == OverlayMenu::ShaderParams && m_chain)
+            m_paramSel = (m_paramSel + 1) % ((int)m_chain->Parameters().size() + 1);
     }
     if (!down) m_downHeld = false;
 
@@ -761,10 +844,11 @@ bool TicoOverlay::HandleInput(SDL_GameController *controller) {
             }
             ApplyScalingSettings(true);
         } else if (m_settingsSelection == 2) {
-            m_shaderSelection = (m_shaderSelection + dir + 6) % 6;
+            CycleShaderPreset(dir);
             ApplyScalingSettings(true);
         }
     }
+    if (dirChanged && m_currentMenu == OverlayMenu::ShaderParams) AdjustShaderParam(dir);
 
     if (confirm && !m_confirmHeld && debounced) {
         m_confirmHeld = true; m_lastInputTime = now;
@@ -791,9 +875,18 @@ bool TicoOverlay::HandleInput(SDL_GameController *controller) {
                 else { int s = (int)m_displaySize; s = (s >= 3) ? 0 : s+1; m_displaySize = (GambatteDisplaySize)s; }
                 ApplyScalingSettings(true);
             } else if (m_settingsSelection == 2) {
-                m_shaderSelection = (m_shaderSelection + 1) % 6;
-                ApplyScalingSettings(true);
+                OpenShaderBrowser(m_browseDir.empty() ? kUserShaderDir : m_browseDir);
+                m_currentMenu = OverlayMenu::ShaderBrowser;
+            } else if (m_settingsSelection == 3) {
+                if (m_chain && !m_chain->Parameters().empty()) {
+                    m_paramSel = 0; m_paramScroll = 0;
+                    m_currentMenu = OverlayMenu::ShaderParams;
+                }
             }
+        } else if (m_currentMenu == OverlayMenu::ShaderBrowser) {
+            ActivateBrowseEntry();
+        } else if (m_currentMenu == OverlayMenu::ShaderParams) {
+            if (m_chain && m_paramSel == (int)m_chain->Parameters().size()) ResetShaderParams();
         }
     }
     if (!confirm) m_confirmHeld = false;
@@ -801,6 +894,12 @@ bool TicoOverlay::HandleInput(SDL_GameController *controller) {
     if (back && !m_backHeld && debounced) {
         m_backHeld = true; m_lastInputTime = now;
         if (m_currentMenu == OverlayMenu::QuickMenu) Hide();
+        else if (m_currentMenu == OverlayMenu::ShaderBrowser) {
+            if (m_browseDir == kUserShaderDir) m_currentMenu = OverlayMenu::Settings;
+            else if (!m_browseEntries.empty() && m_browseEntries[0].label == "..") { m_browseSel = 0; ActivateBrowseEntry(); }
+            else m_currentMenu = OverlayMenu::Settings;
+        }
+        else if (m_currentMenu == OverlayMenu::ShaderParams) { LeaveShaderParams(); m_currentMenu = OverlayMenu::Settings; }
         else m_currentMenu = OverlayMenu::QuickMenu;
     }
     if (!back) m_backHeld = false;
@@ -830,13 +929,25 @@ void TicoOverlay::LoadCoreSettings() {
                 else if (v=="Auto") m_displaySize = GambatteDisplaySize::Auto;
                 else m_displaySize = GambatteDisplaySize::_4_3;
             } else m_displaySize = GambatteDisplaySize::_4_3;
-            if (j.contains("shader_type") && j["shader_type"].is_string()) {
+            m_shaderParams.clear();
+            if (j.contains("shader_parameters") && j["shader_parameters"].is_object()) {
+                for (auto &preset : j["shader_parameters"].items()) {
+                    if (!preset.value().is_object()) continue;
+                    for (auto &param : preset.value().items())
+                        if (param.value().is_number())
+                            m_shaderParams[preset.key()][param.key()] = param.value().get<float>();
+                }
+            }
+            m_shaderPreset.clear();
+            if (j.contains("shader_preset") && j["shader_preset"].is_string()) {
+                m_shaderPreset = j["shader_preset"].get<std::string>();
+            } else if (j.contains("shader_type") && j["shader_type"].is_string()) {
+                // Settings from before slang presets named one of three built-ins.
                 std::string v = j["shader_type"].get<std::string>();
-                if (v=="xBRZ") m_shaderSelection = 1;
-                else if (v=="Eagle") m_shaderSelection = 2;
-                else if (v=="CrtEasyMode") m_shaderSelection = 3;
-                else m_shaderSelection = 0;
-            } else m_shaderSelection = 0;
+                if (v=="xBRZ") m_shaderPreset = kBuiltinShaderDir + std::string("xbrz.slangp");
+                else if (v=="Eagle") m_shaderPreset = kBuiltinShaderDir + std::string("eagle.slangp");
+                else if (v=="CrtEasyMode") m_shaderPreset = kBuiltinShaderDir + std::string("crt-easymode.slangp");
+            }
         } else { m_displayMode = GambatteDisplayMode::Display; m_displaySize = GambatteDisplaySize::_4_3; }
     } else { m_displayMode = GambatteDisplayMode::Display; m_displaySize = GambatteDisplaySize::_4_3; }
     ApplyScalingSettings(false);
@@ -859,18 +970,232 @@ void TicoOverlay::SaveCoreSettings() {
     case GambatteDisplaySize::Auto: sizeStr="Auto"; break; default: break;
     }
     j["display_size"] = sizeStr;
-    const char *shaderStr = "None";
-    switch (m_shaderSelection) {
-    case 1: shaderStr = "xBRZ"; break;
-    case 2: shaderStr = "Eagle"; break;
-    case 3: shaderStr = "CrtEasyMode"; break;
-    default: shaderStr = "None"; break;
-    }
-    j["shader_type"] = shaderStr;
+    j["shader_preset"] = m_shaderPreset;
+    j.erase("shader_type");
+    nlohmann::json params = nlohmann::json::object();
+    for (const auto &preset : m_shaderParams)
+        if (!preset.second.empty())
+            for (const auto &param : preset.second)
+                params[preset.first][param.first] = param.second;
+    j["shader_parameters"] = params;
     std::ofstream out(configPath); if (out.is_open()) { out << j.dump(4); out.close(); }
 }
 
 void TicoOverlay::ApplyScalingSettings(bool save) { if (save) SaveCoreSettings(); }
+
+void TicoOverlay::ScanShaderPresets() {
+    m_shaderPresets.clear();
+    m_shaderPresets.push_back("");
+    for (const char *name : {"xbrz.slangp", "eagle.slangp", "crt-easymode.slangp"})
+        m_shaderPresets.push_back(kBuiltinShaderDir + std::string(name));
+    std::vector<std::string> user;
+    if (DIR *dir = opendir(kUserShaderDir)) {
+        while (struct dirent *e = readdir(dir)) {
+            std::string n = e->d_name;
+            if (n.size() > 7 && n.compare(n.size() - 7, 7, ".slangp") == 0)
+                user.push_back(kUserShaderDir + n);
+        }
+        closedir(dir);
+    }
+    std::sort(user.begin(), user.end());
+    m_shaderPresets.insert(m_shaderPresets.end(), user.begin(), user.end());
+}
+
+void TicoOverlay::CycleShaderPreset(int dir) {
+    ScanShaderPresets();
+    auto it = std::find(m_shaderPresets.begin(), m_shaderPresets.end(), m_shaderPreset);
+    int i = it == m_shaderPresets.end() ? 0 : (int)(it - m_shaderPresets.begin());
+    int n = (int)m_shaderPresets.size();
+    m_shaderPreset = m_shaderPresets[((i + dir) % n + n) % n];
+}
+
+static bool EndsWith(const std::string &s, const char *suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+void TicoOverlay::OpenShaderBrowser(const std::string &dir) {
+    m_browseDir = dir;
+    if (m_browseDir.empty() || m_browseDir.back() != '/') m_browseDir += '/';
+    m_browseEntries.clear();
+    m_browseSel = 0; m_browseScroll = 0;
+
+    if (m_browseDir == kUserShaderDir)
+        m_browseEntries.push_back({tr("emulator_builtin_shaders"), kBuiltinShaderDir, true});
+    else {
+        std::string parent;
+        if (m_browseDir == kBuiltinShaderDir) parent = kUserShaderDir;
+        else {
+            std::string d = m_browseDir.substr(0, m_browseDir.size() - 1);
+            size_t slash = d.find_last_of('/');
+            parent = slash == std::string::npos ? kUserShaderDir : d.substr(0, slash + 1);
+        }
+        m_browseEntries.push_back({"..", parent, true});
+    }
+
+    std::vector<BrowseEntry> dirs, files;
+    if (DIR *d = opendir(m_browseDir.c_str())) {
+        while (struct dirent *e = readdir(d)) {
+            std::string name = e->d_name;
+            if (name.empty() || name[0] == '.') continue;
+            std::string path = m_browseDir + name;
+            bool isDir = e->d_type == DT_DIR;
+            if (e->d_type == DT_UNKNOWN) { struct stat st; isDir = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode); }
+            if (isDir) dirs.push_back({name + "/", path + "/", true});
+            else if (EndsWith(name, ".slangp")) files.push_back({name.substr(0, name.size() - 7), path, false});
+        }
+        closedir(d);
+    }
+    auto byName = [](const BrowseEntry &a, const BrowseEntry &b) {
+        return strcasecmp(a.label.c_str(), b.label.c_str()) < 0;
+    };
+    std::sort(dirs.begin(), dirs.end(), byName);
+    std::sort(files.begin(), files.end(), byName);
+    m_browseEntries.insert(m_browseEntries.end(), dirs.begin(), dirs.end());
+    m_browseEntries.insert(m_browseEntries.end(), files.begin(), files.end());
+
+    // Start on the active preset when it is in this folder.
+    for (size_t i = 0; i < m_browseEntries.size(); i++)
+        if (!m_browseEntries[i].isDir && m_browseEntries[i].path == m_shaderPreset) m_browseSel = (int)i;
+}
+
+void TicoOverlay::ActivateBrowseEntry() {
+    if (m_browseSel < 0 || m_browseSel >= (int)m_browseEntries.size()) return;
+    BrowseEntry entry = m_browseEntries[m_browseSel];
+    if (entry.isDir) {
+        std::string from = m_browseDir;
+        OpenShaderBrowser(entry.path);
+        // Going up lands on the folder we came from.
+        for (size_t i = 0; i < m_browseEntries.size(); i++)
+            if (m_browseEntries[i].path == from) m_browseSel = (int)i;
+        return;
+    }
+    m_shaderPreset = entry.path;
+    ApplyScalingSettings(true);
+    m_currentMenu = OverlayMenu::Settings;
+}
+
+void TicoOverlay::OnShaderLoaded() {
+    if (!m_chain) return;
+    m_chain->ResetParameters();
+    auto it = m_shaderParams.find(m_shaderPreset);
+    if (it == m_shaderParams.end()) return;
+    for (const auto &param : it->second) m_chain->SetParameter(param.first, param.second);
+}
+
+void TicoOverlay::AdjustShaderParam(int dir) {
+    if (!m_chain) return;
+    const auto &params = m_chain->Parameters();
+    if (m_paramSel < 0 || m_paramSel >= (int)params.size()) return;
+    const TicoSlang::Parameter &p = params[m_paramSel];
+    float step = p.step > 0.0f ? p.step : 0.01f;
+    // Snap to the step grid so repeated presses don't accumulate float error.
+    float v = p.minimum + std::round((p.value + dir * step - p.minimum) / step) * step;
+    v = std::clamp(v, p.minimum, p.maximum);
+    m_chain->SetParameter(p.id, v);
+    if (std::fabs(v - p.initial) < step * 0.5f) m_shaderParams[m_shaderPreset].erase(p.id);
+    else m_shaderParams[m_shaderPreset][p.id] = v;
+    m_paramsDirty = true;
+}
+
+void TicoOverlay::ResetShaderParams() {
+    if (m_chain) m_chain->ResetParameters();
+    m_shaderParams.erase(m_shaderPreset);
+    m_paramsDirty = true;
+}
+
+void TicoOverlay::LeaveShaderParams() {
+    if (m_paramsDirty) SaveCoreSettings();
+    m_paramsDirty = false;
+}
+
+void TicoOverlay::RenderScrollList(ImDrawList *dl, ImVec2 displaySize, const std::string &title,
+                                   const std::vector<ListRow> &rows, int selection, int &scroll, bool arrows) {
+    float scale = ImGui::GetIO().FontGlobalScale;
+    const int visible = std::max(1, std::min((int)rows.size(), 8));
+    if (selection < scroll) scroll = selection;
+    if (selection >= scroll + visible) scroll = selection - visible + 1;
+    scroll = std::clamp(scroll, 0, std::max(0, (int)rows.size() - visible));
+
+    float itemH = 56.0f * scale;
+    ImVec2 menuPos, menuSize; float easeOut, cornerRadius;
+    RenderMenuContainer(dl, displaySize, 720.0f * scale, visible, itemH, m_animTimer, m_isDarkMode, menuPos, menuSize, easeOut, cornerRadius);
+    ImFont *font = ImGui::GetFont(); float fs = ImGui::GetFontSize() * 0.8f;
+    ImU32 titleCol = IM_COL32(230, 230, 230, (int)(255 * easeOut));
+    ImVec2 titleSize = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, title.c_str());
+    dl->AddText(font, fs, ImVec2(menuPos.x + 8.0f * scale, menuPos.y - titleSize.y - 10.0f * scale), titleCol, title.c_str());
+
+    dl->PushClipRect(menuPos, menuPos + menuSize, true);
+    for (int r = 0; r < visible; r++) {
+        int i = scroll + r;
+        if (i >= (int)rows.size()) break;
+        bool isSelected = i == selection;
+        ImVec2 itemMin(menuPos.x, menuPos.y + r * itemH), itemMax(menuPos.x + menuSize.x, menuPos.y + (r + 1) * itemH);
+        if (isSelected) UIStyle::DrawSelection(dl, itemMin, itemMax, cornerRadius, easeOut, m_isDarkMode);
+        ImU32 textColor = m_isDarkMode
+            ? (isSelected ? IM_COL32(255,255,255,(int)(255*easeOut)) : IM_COL32(200,200,200,(int)(255*easeOut)))
+            : (isSelected ? IM_COL32(60,60,70,(int)(255*easeOut)) : IM_COL32(90,90,100,(int)(255*easeOut)));
+        const ListRow &row = rows[i];
+        ImVec2 valueSize = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, row.value.c_str());
+        float valueX = itemMax.x - valueSize.x - (arrows ? 40.0f : 20.0f) * scale;
+        float textY = itemMin.y + (itemH - valueSize.y) / 2;
+        dl->PushClipRect(itemMin, ImVec2(valueX - 16.0f * scale, itemMax.y), true);
+        dl->AddText(font, fs, ImVec2(itemMin.x + 20.0f * scale, textY), textColor, row.label.c_str());
+        dl->PopClipRect();
+        dl->AddText(font, fs, ImVec2(valueX, textY), textColor, row.value.c_str());
+        if (isSelected && arrows && !row.value.empty()) {
+            float a = 10.0f * scale, ay = itemMin.y + (itemH - a) / 2;
+            float lx = valueX - a - 10.0f * scale, rx = valueX + valueSize.x + 10.0f * scale;
+            dl->AddTriangleFilled(ImVec2(lx, ay + a/2), ImVec2(lx + a, ay), ImVec2(lx + a, ay + a), textColor);
+            dl->AddTriangleFilled(ImVec2(rx + a, ay + a/2), ImVec2(rx, ay), ImVec2(rx, ay + a), textColor);
+        }
+    }
+    dl->PopClipRect();
+
+    if ((int)rows.size() > visible) {
+        float trackX = menuPos.x + menuSize.x + 8.0f * scale;
+        float thumbH = menuSize.y * visible / rows.size();
+        float thumbY = menuPos.y + (menuSize.y - thumbH) * scroll / (float)(rows.size() - visible);
+        dl->AddRectFilled(ImVec2(trackX, thumbY), ImVec2(trackX + 4.0f * scale, thumbY + thumbH),
+                          IM_COL32(200, 200, 200, (int)(160 * easeOut)), 2.0f * scale);
+    }
+}
+
+void TicoOverlay::RenderShaderBrowser(ImDrawList *dl, ImVec2 displaySize) {
+    std::vector<ListRow> rows;
+    for (const BrowseEntry &e : m_browseEntries)
+        rows.push_back({e.label, (!e.isDir && e.path == m_shaderPreset) ? "*" : ""});
+    if (rows.size() <= 1 && m_browseDir == kUserShaderDir)
+        rows.push_back({tr("emulator_no_shaders"), ""});
+    std::string title = m_browseDir == kUserShaderDir ? tr("emulator_shader") : m_browseDir;
+    RenderScrollList(dl, displaySize, title, rows, m_browseSel, m_browseScroll, false);
+}
+
+void TicoOverlay::RenderShaderParams(ImDrawList *dl, ImVec2 displaySize) {
+    std::vector<ListRow> rows;
+    if (m_chain) {
+        for (const TicoSlang::Parameter &p : m_chain->Parameters()) {
+            char buf[32];
+            bool whole = p.step >= 1.0f && std::fabs(p.value - std::round(p.value)) < 1e-4f;
+            snprintf(buf, sizeof(buf), whole ? "%.0f" : "%.2f", p.value);
+            rows.push_back({p.description.empty() ? p.id : p.description, buf});
+        }
+    }
+    rows.push_back({tr("emulator_reset_parameters"), ""});
+    RenderScrollList(dl, displaySize, tr("emulator_shader_parameters"), rows, m_paramSel, m_paramScroll, true);
+}
+
+std::string TicoOverlay::ShaderPresetLabel() const {
+    if (m_shaderPreset.empty()) return "None";
+    if (m_shaderPreset == kBuiltinShaderDir + std::string("xbrz.slangp")) return "xBRZ";
+    if (m_shaderPreset == kBuiltinShaderDir + std::string("eagle.slangp")) return "Eagle";
+    if (m_shaderPreset == kBuiltinShaderDir + std::string("crt-easymode.slangp")) return "CRT Easy Mode";
+    std::string name = m_shaderPreset;
+    size_t slash = name.find_last_of('/');
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    if (name.size() > 7) name = name.substr(0, name.size() - 7);
+    return name;
+}
 
 void TicoOverlay::LoadSVGIcon() {
     const char *svgContent = R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path fill="#FFFFFF" d="M338.8-9.9c11.9 8.6 16.3 24.2 10.9 37.8L271.3 224 416 224c13.5 0 25.5 8.4 30.1 21.1s.7 26.9-9.6 35.5l-288 240c-11.3 9.4-27.4 9.9-39.3 1.3s-16.3-24.2-10.9-37.8L176.7 288 32 288c-13.5 0-25.5-8.4-30.1-21.1s-.7-26.9 9.6-35.5l288-240c11.3-9.4 27.4-9.9 39.3-1.3z"/></svg>)";
@@ -883,12 +1208,8 @@ void TicoOverlay::LoadSVGIcon() {
     unsigned char *img = (unsigned char *)malloc(w * h * 4);
     if (!img) { nsvgDeleteRasterizer(rast); nsvgDelete(image); return; }
     nsvgRasterize(rast, image, 0, 0, sc, img, w, h, w * 4);
-    if (m_boltTexture != 0) glDeleteTextures(1, &m_boltTexture);
-    glGenTextures(1, &m_boltTexture); glBindTexture(GL_TEXTURE_2D, m_boltTexture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    TicoVulkan::DestroyTexture(m_boltTexture);
+    m_boltTexture = TicoVulkan::CreateTextureRGBA(img, w, h);
     free(img); nsvgDeleteRasterizer(rast); nsvgDelete(image);
 }
 
@@ -924,13 +1245,13 @@ void TicoOverlay::RenderStatusBar(ImDrawList *dl, ImVec2 displaySize) {
     if (currentFillW < 2.0f*scale && pct > 0) currentFillW = 2.0f*scale;
     if (currentFillW > 0) dl->AddRectFilled(bodyMin + ImVec2(pad,pad), bodyMin + ImVec2(pad+currentFillW, bodyH-pad), textColor, 1.0f);
     if (m_isCharging) {
-        if (m_boltTexture == 0) LoadSVGIcon();
-        if (m_boltTexture != 0) {
+        if (m_boltTexture == ImTextureID_Invalid) LoadSVGIcon();
+        if (m_boltTexture != ImTextureID_Invalid) {
             float iconH = 16.0f*scale, iconW = iconH * ((float)m_boltWidth / (float)m_boltHeight);
             ImVec2 iconPos(tipMax.x + 6.0f*scale, batteryPos.y + (bodyH - iconH)*0.5f);
             float fadeProgress = std::max(0.0f, (m_chargingStateProgress - 0.5f) * 2.0f);
             int alphaBolt = (int)(255 * fadeProgress * ease);
-            if (alphaBolt > 0) dl->AddImage((ImTextureID)(intptr_t)m_boltTexture, iconPos, iconPos + ImVec2(iconW,iconH), ImVec2(0,0), ImVec2(1,1), IM_COL32(235,235,235,alphaBolt));
+            if (alphaBolt > 0) dl->AddImage(m_boltTexture, iconPos, iconPos + ImVec2(iconW,iconH), ImVec2(0,0), ImVec2(1,1), IM_COL32(235,235,235,alphaBolt));
         }
     }
 }
