@@ -512,3 +512,6 @@ build_desktop/
 /cache/
 tico/config/
 /imgui.ini
+
+# prebuilt libusbhsfs + read-only NTFS (usbntfs), see tico/deps/usbhsfs
+!tico/deps/usbhsfs/lib/*.a
