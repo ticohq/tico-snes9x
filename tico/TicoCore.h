@@ -6,18 +6,19 @@
 #include <map>
 #include <cstdint>
 #include <SDL.h>
-#include <SDL_mixer.h>
 #include <vector>
-#include <mutex>
-#include <condition_variable>
-#include <functional>
-#include <deque>
 #include "libretro.h"
 #include "imgui.h"
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include <SDL_mixer.h>
 #endif
+
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <deque>
 
 struct rc_client_t;
 
@@ -104,8 +105,28 @@ public:
     std::string GetGamePath() const { return m_gamePath; }
 
     /// @brief Save states
-    void SaveState(const std::string &path);
-    void LoadState(const std::string &path);
+    /// The state goes to `path`, rc_client's achievement progress beside it
+    /// (`path` + ".ra"). Loading is refused while hardcore is active.
+    bool SaveState(const std::string &path);
+    bool LoadState(const std::string &path);
+
+    /// True while rc_client runs the session in hardcore mode. Loading states
+    /// (and rewind, cheats, slow motion) must stay unavailable then.
+    bool IsHardcoreActive() const;
+
+    /// Hardcore rate-limits pausing so it can't be used to slow the game
+    /// down. False while a pause isn't allowed yet; `secondsRemaining` then
+    /// says how long until it is. Always true outside hardcore.
+    bool CanPause(int &secondsRemaining);
+
+    /// Keeps the RetroAchievements session alive while emulation is paused
+    /// (the quick menu is open): pings, server callbacks, badge uploads.
+    void Idle();
+
+    /// @brief Core options. LoadConfig reads snes9x.jsonc (once); SetOption
+    /// changes a libretro variable, which the core re-reads next frame.
+    void EnsureConfigLoaded() { LoadConfig(); }
+    void SetOption(const std::string &key, const std::string &value);
 
     /// @brief Audio callback types
     typedef void (*AudioSampleCallback_t)(int16_t left, int16_t right);
@@ -130,6 +151,14 @@ private:
 
     void LoadSaveData();
     void SaveSaveData();
+    void LoadRtcData();
+    void SaveRtcData();
+
+    /// The loaded ROM, unpacked; kept for RetroAchievements hashing.
+    std::vector<uint8_t> m_romData;
+    static bool IsArchivePath(const std::string &path);
+    static bool ReadRomFile(const std::string &path, std::vector<uint8_t> &out);
+    static bool ReadRomFromArchive(const std::string &path, std::vector<uint8_t> &out);
 
     /// @name Libretro static callbacks (dispatch to instance)
     static bool EnvironmentCallback(unsigned cmd, void *data);

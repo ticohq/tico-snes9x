@@ -16,16 +16,26 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/build_tico"
 TICO_DIR="$ROOT_DIR/tico"
 
-# Rendering is Vulkan on Mesa's NVK, linked statically (loaderless
-# libvulkan.a from a mesa-switch build). Same default as tico-dolphin and
-# tico-flycast; point MESA_NVK_DIR at builddir-switch of a mesa-switch tree.
+# NACP version, and the version RetroAchievements sees in the User-Agent
+APP_VERSION="1.0.3"
+
+# Rendering is Vulkan on Mesa's NVK, linked statically (a loaderless
+# libvulkan.a), as in tico-flycast and tico-gambatte. Point MESA_NVK_DIR at
+# builddir-switch of a mesa-switch tree; without one, the switch-dev image's
+# Horizon-native NVK in portlibs is used.
 MESA_NVK_DIR="${MESA_NVK_DIR:-/nvk-build}"
 NVK_ARCHIVE_SRC="$MESA_NVK_DIR/src/nouveau/vulkan/libvulkan.a"
+NVK_DEPS="-ldrm_nouveau -lexpat"
 if [ ! -f "$NVK_ARCHIVE_SRC" ]; then
-    echo "Error: NVK archive not found at $NVK_ARCHIVE_SRC (set MESA_NVK_DIR)"
+    NVK_ARCHIVE_SRC="$PORTLIBS/lib/libvulkan.a"
+    # no libdrm_nouveau in that build; see its vulkan.pc
+    NVK_DEPS="-lexpat"
+fi
+if [ ! -f "$NVK_ARCHIVE_SRC" ]; then
+    echo "Error: no NVK libvulkan.a (set MESA_NVK_DIR)"
     exit 1
 fi
-echo "NVK: $MESA_NVK_DIR"
+echo "NVK: $NVK_ARCHIVE_SRC"
 
 # ============================================================
 # Step 1: Build snes9x as a static library (.a)
@@ -78,7 +88,7 @@ CXX="${DEVKITA64}/bin/aarch64-none-elf-g++"
 
 COMMON_FLAGS="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE -O2 -g"
 COMMON_FLAGS="$COMMON_FLAGS -ffunction-sections -fdata-sections -DDISABLE_LOGGING -D__SWITCH__ -DHAVE_LIBNX"
-COMMON_FLAGS="$COMMON_FLAGS -DVK_USE_PLATFORM_VI_NN"
+COMMON_FLAGS="$COMMON_FLAGS -DLIBARCHIVE_STATIC -DVK_USE_PLATFORM_VI_NN -DTICO_APP_VERSION=\"$APP_VERSION\""
 COMMON_FLAGS="$COMMON_FLAGS -I$LIBNX/include -I$PORTLIBS/include -I$PORTLIBS/include/SDL2"
 COMMON_FLAGS="$COMMON_FLAGS -I$TICO_DIR -I$TICO_DIR/deps"
 COMMON_FLAGS="$COMMON_FLAGS -I$TICO_DIR/deps/vulkan-headers"
@@ -92,12 +102,15 @@ CXXFLAGS="$COMMON_FLAGS -std=gnu++17 -fvisibility-inlines-hidden -fno-rtti -fno-
 TICO_SOURCES=(
     "$TICO_DIR/TicoMain.cpp"
     "$TICO_DIR/TicoCore.cpp"
-    "$TICO_DIR/TicoOverlay.cpp"
     "$TICO_DIR/TicoVulkan.cpp"
     "$TICO_DIR/TicoShaderChain.cpp"
     "$TICO_DIR/TicoSlang.cpp"
-    "$TICO_DIR/TicoTranslationManager.cpp"
     "$TICO_DIR/TicoStubs.cpp"
+    "$TICO_DIR/overlay/imgui_overlay.cpp"
+    "$TICO_DIR/overlay/overlay_ui.cpp"
+    "$TICO_DIR/overlay/ra_alerts.cpp"
+    "$TICO_DIR/overlay/tico_config.cpp"
+    "$TICO_DIR/overlay/translation_manager.cpp"
 )
 
 # NVK's libvulkan.a exports the vk* entry points, so no loader (volk) here.
@@ -231,7 +244,7 @@ LINK_LIBS="$LINK_LIBS -lSDL2_mixer -lmpg123 -lmodplug -lopusfile -lopus -lvorbis
 
 # SDL2's EGL helpers are satisfied by stubs in TicoStubs.cpp: linking the
 # portlibs Mesa GL stack too would duplicate Mesa's util code inside NVK.
-LINK_LIBS="$LINK_LIBS -ldrm_nouveau -lexpat"
+LINK_LIBS="$LINK_LIBS $NVK_DEPS"
 
 # Mesa merges NVK's archives with the host ar, which leaves the Rust members
 # out of the symbol index; rebuild it with the devkitA64 archiver.
@@ -239,7 +252,7 @@ NVK_ARCHIVE="$BUILD_DIR/libvulkan.a"
 cp "$NVK_ARCHIVE_SRC" "$NVK_ARCHIVE"
 "$DEVKITA64/bin/aarch64-none-elf-ranlib" "$NVK_ARCHIVE"
 
-LINK_LIBS="$LINK_LIBS -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lzstd"
+LINK_LIBS="$LINK_LIBS -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -larchive -lbz2 -llzma -llz4 -lz -lzstd"
 LINK_LIBS="$LINK_LIBS -lnx -lm -lstdc++ -lpthread"
 
 $CXX $LINK_FLAGS \
@@ -267,7 +280,7 @@ NACPTOOL="$DEVKITPRO/tools/bin/nacptool"
 
 # Create NACP
 NACP_FILE="$BUILD_DIR/snes9x.nacp"
-$NACPTOOL --create "tico Snes9x" "ticoverse.com" "1.0.3" "$NACP_FILE"
+$NACPTOOL --create "tico Snes9x" "ticoverse.com" "$APP_VERSION" "$NACP_FILE"
 
 # Convert ELF to NRO with romfs
 ROMFS_DIR="$BUILD_DIR/romfs"
@@ -278,6 +291,9 @@ mkdir -p "$ROMFS_DIR"
 [ -d "$TICO_DIR/lang" ] && cp -r "$TICO_DIR/lang" "$ROMFS_DIR/"
 [ -d "$TICO_DIR/assets" ] && cp -r "$TICO_DIR/assets" "$ROMFS_DIR/"
 [ -d "$TICO_DIR/shaders" ] && cp -r "$TICO_DIR/shaders" "$ROMFS_DIR/"
+# the overlay builds its settings menu from the module's own definition
+mkdir -p "$ROMFS_DIR/module"
+cp "$TICO_DIR/module/settings.json" "$ROMFS_DIR/module/"
 
 ELF2NRO_ARGS=(--nacp="$NACP_FILE")
 
@@ -316,6 +332,8 @@ mkdir -p "$MODULE_OUT"
 # the official modules only as an offline baseline for a fresh install.
 cp -r "$MODULE_SRC/." "$MODULE_OUT/"
 cp "$NRO_OUTPUT" "$MODULE_OUT/"
+# tico merges these into its own strings to label the settings screen
+cp -R "$TICO_DIR/lang" "$MODULE_OUT/"
 
 # Tico prefers .json.gz when resolving a gamelist.
 if [ -d "$MODULE_OUT/gamelists" ]; then

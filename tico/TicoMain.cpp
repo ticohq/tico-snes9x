@@ -2,16 +2,25 @@
 /// @brief Entry point for tico-integrated snes9x NRO
 /// Sets up SDL/Vulkan/ImGui and runs the main loop
 
-#include <cmath>
 #include "TicoCore.h"
-#include "TicoOverlay.h"
 #include "TicoConfig.h"
 #include "TicoAudio.h"
-#include "TicoTranslationManager.h"
 #include "TicoShaderChain.h"
 #include "TicoVulkan.h"
+#include "overlay/imgui_overlay.h"
+#include "overlay/overlay_ui.h"
+#include "overlay/tico_config.h"
+#include "overlay/translation_manager.h"
 
 #include <SDL.h>
+#include <dirent.h>
+#include <json.hpp>
+#include <strings.h>
+#include <algorithm>
+#include <fstream>
+#include <map>
+#include <cctype>
+#include <cmath>
 #include <memory>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +31,6 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
-#include <curl/curl.h>
 #endif
 
 #include "imgui.h"
@@ -32,7 +40,6 @@
 // NX System Configuration (extern "C")
 //==============================================================================
 
-#ifdef __SWITCH__
 extern "C" {
 u32 __NvOptimusEnablement = 1;
 u32 __NvDeveloperOption = 1;
@@ -40,25 +47,56 @@ u32 __nx_applet_type = AppletType_Application;
 u32 __nx_applet_exit_mode = 0; // 0 = standard exit (return to Homebrew ABI loader if NRO). 1 = forceful applet exit
 size_t __nx_heap_size = 0;
 }
-#endif
 
 //==============================================================================
 // Globals
 //==============================================================================
 
 static SDL_Window *g_window = nullptr;
-
-static std::unique_ptr<TicoCore> g_core;
 static std::unique_ptr<TicoShaderChain> g_chain;
 static std::string g_activePreset = "\x01"; // forces the first load
-static std::unique_ptr<TicoOverlay> g_overlay;
+
+namespace OverlayUI = SwitchFrontend::OverlayUI;
+namespace ImGuiOverlay = SwitchFrontend::ImGuiOverlay;
+namespace OverlayConfig = SwitchFrontend::TicoConfig;
+
+static std::unique_ptr<TicoCore> g_core;
+
+// Started without a game: the library lists the ROM folders, and leaving a
+// game returns to it instead of chainloading tico.
+static bool g_standalone = false;
+static std::string g_pendingLaunch;
+static void ShowLibrary();
+
+// Quick menu
+static bool g_menuOpen = false;
+static bool g_overlayReady = false;
+static bool g_toggleHeld = false;
+static uint32_t g_navHeldPrev = 0;
+static int g_navRepeatFrames = 0;
+static constexpr int kNavInitialDelayFrames = 14;
+static constexpr int kNavRepeatFrames = 6;
+
+// Fast forward (Display > Fast Forward): the hotkey, held or toggled, runs the
+// core at fast_forward_speed by emulating extra frames per presented one;
+// "unlimited" drops vsync instead.
+static bool g_ffHotkeyHeld = false;
+static bool g_ffLatched = false;
+static float g_ffFrameBudget = 0.0f;
+static void StopFastForward();
+
+// HUD frame counter
+static int g_hudFrames = 0;
+static float g_hudSeconds = 0.0f;
+static float g_hudFps = 0.0f;
 
 static bool g_running = true;
-static bool g_exitToSystem = false;
 static TicoAudio g_audio;
 static SDL_AudioDeviceID g_audioDevice = 0;
 static SDL_GameController *g_controllers[4] = {nullptr, nullptr, nullptr, nullptr};
 static bool g_controllersDirty = true;
+
+
 
 #ifdef __SWITCH__
 static u8 g_lastOperationMode = 255;
@@ -116,7 +154,7 @@ static bool UpdateScreenMode()
 #endif
 
 //==============================================================================
-// SDL/EGL Initialization
+// SDL/Vulkan Initialization
 //==============================================================================
 
 static void CloseControllers()
@@ -154,7 +192,6 @@ static void RefreshControllers()
     }
 
     g_controllersDirty = false;
-    LOG_INFO("HOME", "Controllers: %d joystick(s), %d opened", joystickCount, controllerIndex);
 }
 
 static void GetDisplayResolution(int &w, int &h)
@@ -245,7 +282,7 @@ bool InitWindow()
     }
     else
     {
-        if (Mix_OpenAudio(48000, AUDIO_S16SYS, 2, 1024) < 0)
+        if (Mix_OpenAudio(44100, AUDIO_S16SYS, 2, 1024) < 0)
         {
             LOG_ERROR("AUDIO", "Mix_OpenAudio failed: %s", Mix_GetError());
         }
@@ -322,7 +359,6 @@ bool InitImGui()
     {
         LOG_WARN("HOME", "Failed to load %s, using built-in ImGui font", TicoConfig::FONT_PATH);
     }
-    
     // Load secondary font for RA alert descriptions
     io.Fonts->AddFontFromFileTTF("romfs:/fonts/description.ttf", TicoConfig::FONT_SIZE * 0.75f);
 #else
@@ -396,216 +432,677 @@ void ProcessEvents()
     }
 }
 
-#ifndef __SWITCH__
-// Desktop debug: TICO_INPUT="frame:button,frame:button,..." drives a virtual
-// gamepad, pressing each SDL button name (a, b, dpup, guide, ...) for a few
-// frames starting at that frame. Lets the overlay be exercised without a pad.
-static void RunInputScript(int frame)
+//==============================================================================
+// Quick menu
+//==============================================================================
+
+static void ChainloadTico()
 {
-    static SDL_Joystick *pad = nullptr;
-    static std::vector<std::pair<int, SDL_GameControllerButton>> script;
-    static bool parsed = false;
-    if (!parsed)
+#ifdef __SWITCH__
+    const char *primaryNro = "sdmc:/switch/tico.nro";
+    const char *fallbackNro = "sdmc:/switch/tico/tico.nro";
+    const char *targetNro = nullptr;
+
+    struct stat buffer;
+    if (stat(primaryNro, &buffer) == 0)
+        targetNro = primaryNro;
+    else if (stat(fallbackNro, &buffer) == 0)
+        targetNro = fallbackNro;
+
+    if (targetNro != nullptr)
     {
-        parsed = true;
-        const char *spec = getenv("TICO_INPUT");
-        if (!spec)
-            return;
-        std::string s = spec;
-        size_t pos = 0;
-        while (pos < s.size())
-        {
-            size_t comma = s.find(',', pos);
-            std::string item = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            size_t colon = item.find(':');
-            if (colon != std::string::npos)
-                script.push_back({atoi(item.substr(0, colon).c_str()),
-                                  SDL_GameControllerGetButtonFromString(item.substr(colon + 1).c_str())});
-            if (comma == std::string::npos)
-                break;
-            pos = comma + 1;
-        }
-        SDL_VirtualJoystickDesc desc;
-        SDL_zero(desc);
-        desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
-        desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
-        desc.naxes = SDL_CONTROLLER_AXIS_MAX;
-        desc.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
-        desc.name = "tico script pad";
-        int index = SDL_JoystickAttachVirtualEx(&desc);
-        pad = index >= 0 ? SDL_JoystickOpen(index) : nullptr;
-        LOG_INFO("HOME", "Script pad: index %d, open %s, controller %d (%s)", index, pad ? "yes" : "no",
-                 index >= 0 ? SDL_IsGameController(index) : -1, SDL_GetError());
+        // Build args as space-separated string (per libnx envSetNextLoad docs)
+        char args[512];
+        snprintf(args, sizeof(args), "%s --resume", targetNro);
+        envSetNextLoad(targetNro, args);
+        LOG_INFO("HOME", "Chainloading back to %s with args: %s", targetNro, args);
     }
-    if (!pad)
-        return;
-    for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++)
+    else
     {
-        bool down = false;
-        for (const auto &step : script)
-            down |= step.second == b && frame >= step.first && frame < step.first + 4;
-        SDL_JoystickSetVirtualButton(pad, b, down ? 1 : 0);
+        LOG_WARN("HOME", "Chainload target not found! Exiting normally.");
+    }
+    remove("imgui.ini");
+#endif
+}
+
+static std::string StatePath(int slot)
+{
+    std::string romName = g_core ? g_core->GetGamePath() : std::string();
+    size_t lastSlash = romName.find_last_of("/\\");
+    if (lastSlash != std::string::npos)
+        romName = romName.substr(lastSlash + 1);
+    size_t lastDot = romName.find_last_of('.');
+    if (lastDot != std::string::npos)
+        romName = romName.substr(0, lastDot);
+    const std::string dir = TicoConfig::StatesPath();
+    TicoConfig::MakeDirs(dir);
+    return dir + romName + ".state" + std::to_string(slot);
+}
+
+//==============================================================================
+// Shaders
+//==============================================================================
+
+#ifdef __SWITCH__
+static const char *kBuiltinShaderDir = "romfs:/shaders/";
+static const char *kUserShaderDir = "sdmc:/tico/shaders/";
+#else
+static const char *kBuiltinShaderDir = "tico/shaders/";
+static const char *kUserShaderDir = "shaders/";
+#endif
+
+// The built-ins, with the names the menu shows for them.
+static const std::pair<const char *, const char *> kBuiltinShaders[] = {
+    {"xbrz.slangp", "xBRZ"},
+    {"eagle.slangp", "Eagle"},
+    {"crt-easymode.slangp", "CRT Easy Mode"},
+};
+
+static bool EndsWith(const std::string &s, const char *suffix)
+{
+    const size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+static std::string ShaderPreset()
+{
+    return OverlayConfig::GetConfigValue("shader_preset", "");
+}
+
+static void SetShaderPreset(const std::string &path)
+{
+    OverlayConfig::SetConfigValue("shader_preset", path);
+    OverlayConfig::SaveConfig();
+}
+
+// Settings from before slang presets picked one of the old GL shaders.
+static void MigrateShaderSetting()
+{
+    if (OverlayConfig::GetConfigValue("shader_preset", "\x01") != "\x01")
+        return; // already chosen, "" included
+    static const std::pair<const char *, const char *> kOld[] = {
+        {"xBRZ", "xbrz.slangp"}, {"Eagle", "eagle.slangp"}, {"CrtEasyMode", "crt-easymode.slangp"},
+    };
+    const std::string old = OverlayConfig::GetConfigValue("shader_type", "None");
+    for (const auto &entry : kOld)
+        if (old == entry.first)
+            SetShaderPreset(kBuiltinShaderDir + std::string(entry.second));
+}
+
+static std::string ShaderPresetLabel()
+{
+    const std::string preset = ShaderPreset();
+    if (preset.empty())
+        return std::string();
+    for (const auto &builtin : kBuiltinShaders)
+        if (preset == kBuiltinShaderDir + std::string(builtin.first))
+            return builtin.second;
+    std::string name = preset;
+    const size_t slash = name.find_last_of('/');
+    if (slash != std::string::npos)
+        name = name.substr(slash + 1);
+    return EndsWith(name, ".slangp") ? name.substr(0, name.size() - 7) : name;
+}
+
+// The browser: the user folder lists the built-ins first, every other folder
+// its parent; then subfolders and presets, by name.
+static std::vector<OverlayUI::ShaderBrowseEntry> BrowseShaders(std::string dir)
+{
+    using Entry = OverlayUI::ShaderBrowseEntry;
+    if (dir.empty() || dir.back() != '/')
+        dir += '/';
+    std::vector<Entry> entries;
+    if (dir == kUserShaderDir)
+    {
+        entries.push_back({"> " + SwitchFrontend::OverlayTranslation::tr("emulator_builtin_shaders"),
+                           kBuiltinShaderDir, true});
+        entries.push_back({SwitchFrontend::OverlayTranslation::tr("emulator_none"), "", false});
+    }
+    else
+    {
+        std::string parent = kUserShaderDir;
+        if (dir != kBuiltinShaderDir)
+        {
+            const std::string d = dir.substr(0, dir.size() - 1);
+            const size_t slash = d.find_last_of('/');
+            if (slash != std::string::npos)
+                parent = d.substr(0, slash + 1);
+        }
+        entries.push_back({"..", parent, true});
+    }
+    if (dir == kBuiltinShaderDir)
+    {
+        for (const auto &builtin : kBuiltinShaders)
+            entries.push_back({builtin.second, dir + builtin.first, false});
+        return entries;
+    }
+
+    std::vector<Entry> dirs, files;
+    if (DIR *d = opendir(dir.c_str()))
+    {
+        while (struct dirent *e = readdir(d))
+        {
+            const std::string name = e->d_name;
+            if (name.empty() || name[0] == '.')
+                continue;
+            const std::string path = dir + name;
+            bool isDir = e->d_type == DT_DIR;
+            if (e->d_type == DT_UNKNOWN)
+            {
+                struct stat st;
+                isDir = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+            }
+            if (isDir)
+                dirs.push_back({name + "/", path + "/", true});
+            else if (EndsWith(name, ".slangp"))
+                files.push_back({name.substr(0, name.size() - 7), path, false});
+        }
+        closedir(d);
+    }
+    auto byName = [](const Entry &a, const Entry &b) {
+        return strcasecmp(a.label.c_str(), b.label.c_str()) < 0;
+    };
+    std::sort(dirs.begin(), dirs.end(), byName);
+    std::sort(files.begin(), files.end(), byName);
+    entries.insert(entries.end(), dirs.begin(), dirs.end());
+    entries.insert(entries.end(), files.begin(), files.end());
+    return entries;
+}
+
+// Parameter overrides per preset, in snes9x.jsonc's shader_parameters.
+static nlohmann::json ShaderParameterOverrides()
+{
+    const std::string text = OverlayConfig::GetConfigJson("shader_parameters");
+    nlohmann::json j = text.empty() ? nlohmann::json::object()
+                                    : nlohmann::json::parse(text, nullptr, false);
+    return j.is_object() ? j : nlohmann::json::object();
+}
+
+static void SaveShaderParameterOverrides(const nlohmann::json &j)
+{
+    OverlayConfig::SetConfigJson("shader_parameters", j.dump());
+    OverlayConfig::SaveConfig();
+}
+
+// A preset just loaded: start from its defaults, then the saved overrides.
+static void OnShaderLoaded()
+{
+    if (!g_chain)
+        return;
+    g_chain->ResetParameters();
+    const nlohmann::json overrides = ShaderParameterOverrides();
+    const auto it = overrides.find(ShaderPreset());
+    if (it == overrides.end() || !it->is_object())
+        return;
+    for (const auto &param : it->items())
+        if (param.value().is_number())
+            g_chain->SetParameter(param.key(), param.value().get<float>());
+}
+
+static void SetShaderParameter(const std::string &id, float value)
+{
+    if (!g_chain)
+        return;
+    g_chain->SetParameter(id, value);
+    nlohmann::json overrides = ShaderParameterOverrides();
+    nlohmann::json &preset = overrides[ShaderPreset()];
+    if (!preset.is_object())
+        preset = nlohmann::json::object();
+    for (const TicoSlang::Parameter &p : g_chain->Parameters())
+    {
+        if (p.id != id)
+            continue;
+        const float step = p.step > 0.0f ? p.step : 0.01f;
+        if (std::fabs(value - p.initial) < step * 0.5f)
+            preset.erase(id);
+        else
+            preset[id] = value;
+    }
+    if (preset.empty())
+        overrides.erase(ShaderPreset());
+    SaveShaderParameterOverrides(overrides);
+}
+
+static void ResetShaderParameters()
+{
+    if (g_chain)
+        g_chain->ResetParameters();
+    nlohmann::json overrides = ShaderParameterOverrides();
+    overrides.erase(ShaderPreset());
+    SaveShaderParameterOverrides(overrides);
+}
+
+static void RegisterShaderMenu()
+{
+    OverlayUI::ShaderCallbacks callbacks;
+    callbacks.preset_label = [] { return ShaderPresetLabel(); };
+    callbacks.browse_start = [] {
+        const std::string preset = ShaderPreset();
+        const size_t slash = preset.find_last_of('/');
+        return slash == std::string::npos ? std::string(kUserShaderDir) : preset.substr(0, slash + 1);
+    };
+    callbacks.browse = [](const std::string &dir) { return BrowseShaders(dir); };
+    callbacks.select = [](const std::string &path) { SetShaderPreset(path); };
+    callbacks.parameters = [] {
+        std::vector<OverlayUI::ShaderParameter> out;
+        if (g_chain)
+            for (const TicoSlang::Parameter &p : g_chain->Parameters())
+                out.push_back({p.id, p.description, p.value, p.minimum, p.maximum, p.step});
+        return out;
+    };
+    callbacks.set_parameter = [](const std::string &id, float value) { SetShaderParameter(id, value); };
+    callbacks.reset_parameters = [] { ResetShaderParameters(); };
+    OverlayUI::SetShaderCallbacks(std::move(callbacks));
+}
+
+// Loads the preset the settings name once it differs from the active one.
+// Compiling can take a while on the Switch, so the frame before it shows a
+// toast instead of the screen just freezing.
+static void ApplyShaderPreset()
+{
+    const std::string wanted = ShaderPreset();
+    if (!g_chain || wanted == g_activePreset)
+        return;
+    static std::string announced;
+    if (announced != wanted && !wanted.empty())
+    {
+        announced = wanted;
+        OverlayUI::ShowToast(SwitchFrontend::OverlayTranslation::tr("emulator_loading_shader"),
+                             OverlayUI::ToastCorner::TopRight);
+        return;
+    }
+    announced.clear();
+    std::string error;
+    if (g_chain->LoadPreset(wanted, error))
+    {
+        g_activePreset = wanted;
+        OnShaderLoaded();
+        return;
+    }
+    LOG_ERROR("SHADER", "Cannot load %s: %s", wanted.c_str(), error.c_str());
+    const std::string firstLine = error.substr(0, error.find('\n'));
+    OverlayUI::ShowToast(SwitchFrontend::OverlayTranslation::tr("emulator_shader_failed") + ": " +
+                             firstLine.substr(0, 80),
+                         OverlayUI::ToastCorner::TopRight);
+    // Keep showing (and saving) what actually runs.
+    if (g_activePreset == "\x01")
+        g_activePreset.clear();
+    SetShaderPreset(g_activePreset);
+}
+
+// settings.json is the one settings definition: every core option it lists
+// reaches the core, with its default when the config file does not set it.
+static void ApplySettingsToCore()
+{
+    if (!g_core)
+        return;
+    OverlayConfig::ApplyToCore([](const std::string &key, const std::string &value) {
+        g_core->SetOption(key, value);
+    });
+}
+
+static std::string TrFormat(const char *key, int value)
+{
+    SwitchFrontend::OverlayTranslation::TranslationManager::Instance().Init();
+    const std::string format = SwitchFrontend::OverlayTranslation::tr(key);
+    char text[256];
+    snprintf(text, sizeof(text), format.c_str(), value);
+    return text;
+}
+
+static void OpenMenu()
+{
+    if (!g_overlayReady || g_menuOpen)
+        return;
+    // Opening the menu pauses the game, which hardcore only allows so often.
+    int waitSeconds = 0;
+    if (g_core && !g_core->CanPause(waitSeconds))
+    {
+        OverlayUI::ShowToast(TrFormat("emulator_hardcore_pause_wait", waitSeconds));
+        return;
+    }
+    g_menuOpen = true;
+    g_navHeldPrev = 0;
+    g_navRepeatFrames = 0;
+    OverlayUI::SetHardcoreMode(g_core && g_core->IsHardcoreActive());
+    StopFastForward();
+    ImGuiOverlay::SetVisible(true);
+}
+
+static void CloseMenu()
+{
+    if (!g_menuOpen)
+        return;
+    g_menuOpen = false;
+    ImGuiOverlay::SetVisible(false);
+    if (g_core)
+        g_core->ClearInputs();
+}
+
+// D-pad + left stick, edge plus hold-repeat; Switch A accepts, B goes back.
+static void FeedMenu(SDL_GameController *pad)
+{
+    enum : uint32_t { Up = 1, Down = 2, Left = 4, Right = 8 };
+    const Sint16 axisX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+    const Sint16 axisY = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+    uint32_t held = 0;
+    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) || axisY < -16000) held |= Up;
+    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || axisY > 16000) held |= Down;
+    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || axisX < -16000) held |= Left;
+    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || axisX > 16000) held |= Right;
+
+    uint32_t fire = held & ~g_navHeldPrev; // new presses fire instantly
+    if (held != 0 && held == g_navHeldPrev)
+    {
+        if (--g_navRepeatFrames <= 0)
+        {
+            fire |= held;
+            g_navRepeatFrames = kNavRepeatFrames;
+        }
+    }
+    else if (fire != 0)
+    {
+        g_navRepeatFrames = kNavInitialDelayFrames;
+    }
+    g_navHeldPrev = held;
+
+    // SDL names buttons by position: B is the Switch A (east), A the Switch B.
+    static bool acceptHeld = false;
+    static bool cancelHeld = false;
+    const bool accept = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B);
+    const bool cancel = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A);
+    ImGuiOverlay::FeedNav({
+        .up = (fire & Up) != 0,
+        .down = (fire & Down) != 0,
+        .left = (fire & Left) != 0,
+        .right = (fire & Right) != 0,
+        .accept = accept && !acceptHeld,
+        .cancel = cancel && !cancelHeld,
+    });
+    acceptHeld = accept;
+    cancelHeld = cancel;
+}
+
+// Carries out what the menu chose on the last drawn frame.
+static void RunMenuAction()
+{
+    using OverlayUI::Action;
+    const Action action = ImGuiOverlay::ConsumeAction();
+    if (OverlayUI::ConsumeSettingsChanged())
+        ApplySettingsToCore();
+
+    switch (action)
+    {
+    case Action::None:
+        return;
+    case Action::Resume:
+        CloseMenu();
+        return;
+    case Action::Exit:
+        LOG_INFO("HOME", "Exit requested");
+        if (g_standalone)
+        {
+            // a game returns to the library; the library itself quits
+            if (g_core)
+                ShowLibrary();
+            else
+                g_running = false;
+            return;
+        }
+        CloseMenu();
+        ChainloadTico();
+        g_running = false;
+        return;
+    case Action::Reset:
+        if (g_core)
+            g_core->Reset();
+        CloseMenu();
+        return;
+    default:
+        break;
+    }
+
+    if (OverlayUI::IsSaveStateAction(action) && g_core)
+    {
+        const int slot = OverlayUI::GetStateSlotForAction(action);
+        const bool saved = g_core->SaveState(StatePath(slot - 1));
+        OverlayUI::ShowToast(TrFormat(saved ? "emulator_state_saved" : "emulator_save_failed", slot));
+        CloseMenu();
+    }
+    else if (OverlayUI::IsLoadStateAction(action) && g_core)
+    {
+        const int slot = OverlayUI::GetStateSlotForAction(action);
+        if (g_core->IsHardcoreActive())
+            OverlayUI::ShowToast(SwitchFrontend::OverlayTranslation::tr("emulator_hardcore_no_load"));
+        else
+        {
+            const bool loaded = g_core->LoadState(StatePath(slot - 1));
+            OverlayUI::ShowToast(TrFormat(loaded ? "emulator_state_loaded" : "emulator_load_failed", slot));
+        }
+        CloseMenu();
     }
 }
-#endif
 
-void HandleInput()
+static void UpdateHud(float deltaTime)
 {
-#ifndef __SWITCH__
-    static int inputFrame = 0;
-    RunInputScript(++inputFrame);
-#endif
-    SDL_GameController *controllers[4] = {nullptr, nullptr, nullptr, nullptr};
-    int numControllers = 0;
-
-    if (g_controllersDirty)
+    g_hudFrames++;
+    g_hudSeconds += deltaTime;
+    if (g_hudSeconds >= 0.5f)
     {
-        RefreshControllers();
+        g_hudFps = static_cast<float>(g_hudFrames) / g_hudSeconds;
+        g_hudFrames = 0;
+        g_hudSeconds = 0.0f;
     }
-
-    for (int i = 0; i < 4; ++i)
-    {
-        if (g_controllers[i])
-            controllers[numControllers++] = g_controllers[i];
-    }
-
-
-    if (g_overlay && numControllers > 0 && g_overlay->HandleInput(controllers[0]))
-    {
-        if (g_overlay->ShouldExitToSystem())
-        {
-            LOG_INFO("HOME", "ExitToSystem: terminating process");
-            remove("imgui.ini");
-            g_exitToSystem = true;
-            g_running = false;
-        }
-        if (g_overlay->ShouldExit())
-        {
-            LOG_INFO("HOME", "ShouldExit detected! g_running will be false.");
-#ifdef __SWITCH__
-            const char *primaryNro = "sdmc:/switch/tico.nro";
-            const char *fallbackNro = "sdmc:/switch/tico/tico.nro";
-            const char *targetNro = nullptr;
-
-            // Check if primaryNro exists, else check fallbackNro
-            struct stat buffer;
-            if (stat(primaryNro, &buffer) == 0)
-            {
-                targetNro = primaryNro;
-            }
-            else if (stat(fallbackNro, &buffer) == 0)
-            {
-                targetNro = fallbackNro;
-            }
-
-            if (targetNro != nullptr)
-            {
-                // Build args as space-separated string (per libnx envSetNextLoad docs)
-                // Format: "nro_path --resume"
-                char args[512];
-                snprintf(args, sizeof(args), "%s --resume", targetNro);
-
-                envSetNextLoad(targetNro, args);
-                LOG_INFO("HOME", "Chainloading back to %s with args: %s", targetNro, args);
-            }
-            else
-            {
-                LOG_WARN("HOME", "Chainload target not found! Exiting normally.");
-            }
-
-            // Clean up imgui.ini to avoid clutter/persistence issues
-            remove("imgui.ini");
-            LOG_INFO("HOME", "Deleted imgui.ini");
-#endif
-            g_running = false;
-        }
-        if (g_overlay->ShouldReset())
-        {
-            g_overlay->ClearReset();
-            if (g_core)
-            {
-                g_core->Reset();
-            }
-        }
-        return;
-    }
-
+    OverlayUI::HudStats stats;
+    stats.fps = g_hudFps;
+    stats.fast_forward = g_audio.IsFastForwarding();
     if (g_core)
     {
-        g_core->ClearInputs();
+        stats.rendered_width = g_core->GetFrameWidth();
+        stats.rendered_height = g_core->GetFrameHeight();
+    }
+    OverlayUI::SetHudStats(stats);
+}
 
-        for (int p = 0; p < numControllers; p++)
+// The game's on-screen rectangle, from the Display tab: Integer scales the
+// frame by 1x, 2x or the largest that fits ("Auto"); Display fits an aspect
+// ratio (4:3, 16:9, the core's own "Original") or stretches.
+static ImVec4 ComputeGameRect(ImVec2 displaySize)
+{
+    const int width = g_core ? g_core->GetFrameWidth() : 256;
+    const int height = g_core ? g_core->GetFrameHeight() : 224;
+    const float aspectRatio = g_core ? g_core->GetAspectRatio() : 4.0f / 3.0f;
+    const std::string mode = OverlayConfig::GetConfigValue("display_mode", "Display");
+    const std::string size = OverlayConfig::GetConfigValue("display_size", "4:3");
+
+    const float baseW = width > 0 ? static_cast<float>(width) : 256.0f;
+    const float baseH = height > 0 ? static_cast<float>(height) : 224.0f;
+    float dstWidth = displaySize.x;
+    float dstHeight = displaySize.y;
+    if (mode == "Integer")
+    {
+        int scale;
+        if (size == "1x")
+            scale = 1;
+        else if (size == "2x")
+            scale = 2;
+        else
+            scale = std::max(1, std::min(static_cast<int>(displaySize.x / baseW),
+                                         static_cast<int>(displaySize.y / baseH)));
+        dstWidth = std::min(displaySize.x, baseW * scale);
+        dstHeight = std::min(displaySize.y, baseH * scale);
+    }
+    else if (size != "Stretch")
+    {
+        float ar = aspectRatio > 0.0f ? aspectRatio : baseW / baseH;
+        if (size == "4:3")
+            ar = 4.0f / 3.0f;
+        else if (size == "16:9")
+            ar = 16.0f / 9.0f;
+        if (ar > displaySize.x / displaySize.y)
         {
-            SDL_GameController *controller = controllers[p];
-            if (!controller) continue;
-
-            // Standard RetroPad mapping for Switch (SDL assumes Xbox layout)
-            // Switch A (Right, SDL B) -> RetroPad A (Right)
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_A,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_B));
-            // Switch B (Bottom, SDL A) -> RetroPad B (Bottom)
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_B,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_A));
-            // Switch X (Top, SDL Y) -> RetroPad X (Top)
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_X,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_Y));
-            // Switch Y (Left, SDL X) -> RetroPad Y (Left)
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_Y,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_X));
-
-            // Switch + -> RetroPad Start
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_START,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_START));
-            // Switch - -> RetroPad Select
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_SELECT,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_BACK));
-
-            // Switch DPad + Left Stick -> RetroPad DPad
-            int16_t leftX = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
-            int16_t leftY = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
-
-            bool dpadUp = SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_UP) || (leftY < -16000);
-            bool dpadDown = SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || (leftY > 16000);
-            bool dpadLeft = SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || (leftX < -16000);
-            bool dpadRight = SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || (leftX > 16000);
-
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_UP, dpadUp);
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_DOWN, dpadDown);
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_LEFT, dpadLeft);
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_RIGHT, dpadRight);
-
-            // Switch L -> RetroPad L
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_L,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER));
-            // Switch R -> RetroPad R
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_R,
-                                  SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER));
-            
-            bool zl = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000;
-            bool zr = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000;
-
-            if (p == 0)
-            {
-                g_audio.SetFastForward(zr);
-            }
-
-            // Switch ZL -> RetroPad L2
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_L2, zl);
-            // Switch ZR -> RetroPad R2
-            g_core->SetInputState(p, RETRO_DEVICE_ID_JOYPAD_R2, zr);
-
-            // Left stick -> RetroPad Analog Left
-            g_core->SetAnalogState(p, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X,
-                                   SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX));
-            g_core->SetAnalogState(p, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y,
-                                   SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY));
-            // Right stick -> RetroPad Analog Right
-            g_core->SetAnalogState(p, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X,
-                                   SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX));
-            g_core->SetAnalogState(p, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y,
-                                   SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTY));
+            dstWidth = displaySize.x;
+            dstHeight = displaySize.x / ar;
+        }
+        else
+        {
+            dstHeight = displaySize.y;
+            dstWidth = displaySize.y * ar;
         }
     }
+    dstWidth = std::floor(dstWidth);
+    dstHeight = std::floor(dstHeight);
+    return ImVec4(std::floor((displaySize.x - dstWidth) / 2.0f),
+                  std::floor((displaySize.y - dstHeight) / 2.0f), dstWidth, dstHeight);
+}
+
+// Runs the shader chain at the game's on-screen size and draws its output.
+static void DrawGame(VkCommandBuffer cmd, ImDrawList *dl, ImVec2 displaySize)
+{
+    dl->AddRectFilled(ImVec2(0, 0), displaySize, IM_COL32(0, 0, 0, 255));
+    if (!g_core)
+        return; // the library: no game, and no stale frame behind it
+    const ImVec4 rect = ComputeGameRect(displaySize);
+    if (!g_chain || !cmd || rect.z < 1.0f || rect.w < 1.0f)
+        return;
+    const float ar = g_core ? g_core->GetAspectRatio() : 4.0f / 3.0f;
+    const ImTextureID tex = g_chain->Process(cmd, (uint32_t)rect.z, (uint32_t)rect.w, ar,
+                                             g_core ? g_core->GetFPS() : 60.0);
+    if (tex != ImTextureID_Invalid)
+        dl->AddImage(tex, ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.z, rect.y + rect.w));
+}
+
+// Switch buttons by their Nintendo names, as the Controls tab spells them.
+enum class SwitchButton
+{
+    A, B, X, Y, L, R, ZL, ZR, Plus, Minus, StickL, StickR, Up, Down, Left, Right, Count
+};
+
+static constexpr uint32_t SwitchBit(SwitchButton button)
+{
+    return 1u << static_cast<unsigned>(button);
+}
+
+static uint32_t SwitchBitFor(const std::string &name)
+{
+    static const std::pair<const char *, SwitchButton> kNames[] = {
+        {"A", SwitchButton::A}, {"B", SwitchButton::B}, {"X", SwitchButton::X},
+        {"Y", SwitchButton::Y}, {"L", SwitchButton::L}, {"R", SwitchButton::R},
+        {"ZL", SwitchButton::ZL}, {"ZR", SwitchButton::ZR}, {"Plus", SwitchButton::Plus},
+        {"Minus", SwitchButton::Minus}, {"StickL", SwitchButton::StickL},
+        {"StickR", SwitchButton::StickR}, {"Up", SwitchButton::Up},
+        {"Down", SwitchButton::Down}, {"Left", SwitchButton::Left},
+        {"Right", SwitchButton::Right},
+    };
+    for (const auto &entry : kNames)
+        if (name == entry.first)
+            return SwitchBit(entry.second);
+    return 0; // "None"
+}
+
+// SDL names buttons by position (Xbox layout): its B is the Switch A, its A
+// the Switch B, its Y the Switch X and its X the Switch Y.
+static uint32_t SwitchButtonsHeld(SDL_GameController *pad)
+{
+    struct SdlButton
+    {
+        SDL_GameControllerButton sdl;
+        SwitchButton button;
+    };
+    static const SdlButton kButtons[] = {
+        {SDL_CONTROLLER_BUTTON_B, SwitchButton::A},
+        {SDL_CONTROLLER_BUTTON_A, SwitchButton::B},
+        {SDL_CONTROLLER_BUTTON_Y, SwitchButton::X},
+        {SDL_CONTROLLER_BUTTON_X, SwitchButton::Y},
+        {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SwitchButton::L},
+        {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, SwitchButton::R},
+        {SDL_CONTROLLER_BUTTON_START, SwitchButton::Plus},
+        {SDL_CONTROLLER_BUTTON_BACK, SwitchButton::Minus},
+        {SDL_CONTROLLER_BUTTON_LEFTSTICK, SwitchButton::StickL},
+        {SDL_CONTROLLER_BUTTON_RIGHTSTICK, SwitchButton::StickR},
+        {SDL_CONTROLLER_BUTTON_DPAD_UP, SwitchButton::Up},
+        {SDL_CONTROLLER_BUTTON_DPAD_DOWN, SwitchButton::Down},
+        {SDL_CONTROLLER_BUTTON_DPAD_LEFT, SwitchButton::Left},
+        {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SwitchButton::Right},
+    };
+    uint32_t held = 0;
+    for (const SdlButton &button : kButtons)
+        if (SDL_GameControllerGetButton(pad, button.sdl))
+            held |= SwitchBit(button.button);
+    if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000)
+        held |= SwitchBit(SwitchButton::ZL);
+    if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000)
+        held |= SwitchBit(SwitchButton::ZR);
+    return held;
+}
+
+// SNES buttons, with the Switch button each sits on by default: the pads
+// share a layout, so each is on its namesake.
+struct ButtonMapping
+{
+    const char *key;
+    const char *fallback;
+    unsigned retroId;
+};
+static const ButtonMapping kButtonMappings[] = {
+    {"map_a", "A", RETRO_DEVICE_ID_JOYPAD_A},
+    {"map_b", "B", RETRO_DEVICE_ID_JOYPAD_B},
+    {"map_x", "X", RETRO_DEVICE_ID_JOYPAD_X},
+    {"map_y", "Y", RETRO_DEVICE_ID_JOYPAD_Y},
+    {"map_l", "L", RETRO_DEVICE_ID_JOYPAD_L},
+    {"map_r", "R", RETRO_DEVICE_ID_JOYPAD_R},
+    {"map_start", "Plus", RETRO_DEVICE_ID_JOYPAD_START},
+    {"map_select", "Minus", RETRO_DEVICE_ID_JOYPAD_SELECT},
+    {"map_up", "Up", RETRO_DEVICE_ID_JOYPAD_UP},
+    {"map_down", "Down", RETRO_DEVICE_ID_JOYPAD_DOWN},
+    {"map_left", "Left", RETRO_DEVICE_ID_JOYPAD_LEFT},
+    {"map_right", "Right", RETRO_DEVICE_ID_JOYPAD_RIGHT},
+};
+
+// Updates fast forward from player 1's hotkey and returns the hotkey's
+// Switch button (0 when there is none), which then stays out of the game.
+static uint32_t UpdateFastForward(SDL_GameController *pad)
+{
+    const uint32_t button = SwitchBitFor(OverlayConfig::GetConfigValue("fast_forward_hotkey", "ZR"));
+    const bool down = pad && button && (SwitchButtonsHeld(pad) & button);
+    bool active;
+    if (OverlayConfig::GetConfigValue("fast_forward_mode", "hold") == "toggle")
+    {
+        if (down && !g_ffHotkeyHeld)
+            g_ffLatched = !g_ffLatched;
+        active = g_ffLatched;
+    }
+    else
+    {
+        active = down;
+    }
+    g_ffHotkeyHeld = down;
+    if (!active)
+        g_ffFrameBudget = 0.0f;
+    g_audio.SetFastForward(active);
+    return button;
+}
+
+static void StopFastForward()
+{
+    g_ffLatched = false;
+    g_ffFrameBudget = 0.0f;
+    g_audio.SetFastForward(false);
+}
+
+// Core frames to run before the next present.
+static int FramesThisRefresh()
+{
+    if (!g_audio.IsFastForwarding())
+        return 1;
+    const std::string speed = OverlayConfig::GetConfigValue("fast_forward_speed", "200");
+    if (speed == "unlimited")
+        return 1; // vsync is off instead
+    float rate = std::max(1.0f, std::atoi(speed.c_str()) / 100.0f);
+    g_ffFrameBudget += rate;
+    const int frames = static_cast<int>(g_ffFrameBudget);
+    g_ffFrameBudget -= frames;
+    return std::max(1, frames);
 }
 
 // The display refreshes at 60 Hz and vsync paces the loop, so the core's own
@@ -632,6 +1129,378 @@ static void UpdateFramePacing()
     g_audio.SetCoreSampleRate(g_core->GetSampleRate() * (effectiveFps / fps));
     LOG_INFO("AUDIO", "Core %.3f fps, %.0f Hz: running %.3f core frames per vsync",
              fps, g_core->GetSampleRate(), g_frameStep);
+}
+
+static bool FastForwardUncapped()
+{
+    return g_audio.IsFastForwarding() &&
+           OverlayConfig::GetConfigValue("fast_forward_speed", "200") == "unlimited";
+}
+
+//==============================================================================
+// Library (standalone launch)
+//==============================================================================
+
+static const char *kRomExtensions[] = {".sfc", ".smc", ".fig", ".swc", ".bs", ".st", ".zip", ".7z", ".rar"};
+
+static std::string LowerExtension(const std::string &path)
+{
+    const size_t dot = path.find_last_of('.');
+    const size_t slash = path.find_last_of('/');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+        return std::string();
+    std::string ext = path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return ext;
+}
+
+// Snes9x runs one console.
+static std::string SlugForRom(const std::string &)
+{
+    return "snes";
+}
+
+// The consoles the library lists, each with its own folders.
+struct LibraryConsole
+{
+    const char *slug;
+    const char *title;
+};
+static const LibraryConsole kLibraryConsoles[] = {
+    {"snes", "Super Nintendo"},
+};
+
+static std::string WithSlash(std::string path)
+{
+    std::replace(path.begin(), path.end(), '\\', '/');
+    if (!path.empty() && path.back() != '/')
+        path += '/';
+    return path;
+}
+
+// tico's ROM bases (general.jsonc): the ROMs path, then the extra bases. A
+// console's games are in <base>/<slug>/ under each, as tico scans them.
+static std::vector<std::string> TicoRomBases()
+{
+    std::vector<std::string> bases;
+#ifdef __SWITCH__
+    std::ifstream file("sdmc:/tico/config/general.jsonc");
+#else
+    std::ifstream file("tico/config/general.jsonc");
+#endif
+    const nlohmann::json j = file.good() ? nlohmann::json::parse(file, nullptr, false, true)
+                                         : nlohmann::json();
+    std::string roms = j.is_object() ? j.value("roms_path", std::string()) : std::string();
+    bases.push_back(WithSlash(roms.empty() ? "sdmc:/tico/roms/" : roms));
+    if (j.is_object() && j.contains("rom_base_paths") && j["rom_base_paths"].is_array())
+        for (const auto &base : j["rom_base_paths"])
+            if (base.is_string() && !base.get<std::string>().empty())
+                bases.push_back(WithSlash(base.get<std::string>()));
+    return bases;
+}
+
+// The module's own folders per console (tico_rom_folders in snes9x.jsonc),
+// the same list tico's Paths tab edits.
+static nlohmann::json ModuleRomFolders()
+{
+    const std::string text = OverlayConfig::GetConfigJson("tico_rom_folders");
+    nlohmann::json j = text.empty() ? nlohmann::json::object()
+                                    : nlohmann::json::parse(text, nullptr, false);
+    return j.is_object() ? j : nlohmann::json::object();
+}
+
+static std::vector<std::string> ModuleRomFolders(const std::string &slug)
+{
+    std::vector<std::string> folders;
+    const nlohmann::json all = ModuleRomFolders();
+    const auto it = all.find(slug);
+    if (it != all.end() && it->is_array())
+        for (const auto &entry : *it)
+            if (entry.is_string() && !entry.get<std::string>().empty())
+                folders.push_back(WithSlash(entry.get<std::string>()));
+    return folders;
+}
+
+static void SetModuleRomFolders(const std::string &slug, const std::vector<std::string> &folders)
+{
+    nlohmann::json all = ModuleRomFolders();
+    if (folders.empty())
+        all.erase(slug);
+    else
+        all[slug] = folders;
+    OverlayConfig::SetConfigJson("tico_rom_folders", all.dump());
+    OverlayConfig::SaveConfig();
+}
+
+// Every folder a console's games are read from: each base's <base>/<slug>/,
+// then the module's own folders.
+static std::vector<std::string> RomFoldersFor(const std::string &slug)
+{
+    std::vector<std::string> folders;
+    for (const std::string &base : TicoRomBases())
+        folders.push_back(base + slug + "/");
+    for (const std::string &folder : ModuleRomFolders(slug))
+        if (std::find(folders.begin(), folders.end(), folder) == folders.end())
+            folders.push_back(folder);
+    return folders;
+}
+
+// The console of each listed game, by path: the folder list it was found in.
+static std::map<std::string, std::string> g_librarySlugs;
+
+static void ScanRomFolder(const std::string &dir, int depth, std::vector<std::string> &out)
+{
+    DIR *d = opendir(dir.c_str());
+    if (!d)
+        return;
+    while (struct dirent *e = readdir(d))
+    {
+        const std::string name = e->d_name;
+        if (name.empty() || name[0] == '.')
+            continue;
+        const std::string path = (dir.back() == '/' ? dir : dir + "/") + name;
+        bool isDir = e->d_type == DT_DIR;
+        if (e->d_type == DT_UNKNOWN)
+        {
+            struct stat st;
+            isDir = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        }
+        if (isDir)
+        {
+            if (depth > 0)
+                ScanRomFolder(path, depth - 1, out);
+            continue;
+        }
+        const std::string ext = LowerExtension(name);
+        for (const char *known : kRomExtensions)
+            if (ext == known)
+                out.push_back(path);
+    }
+    closedir(d);
+}
+
+static std::vector<OverlayUI::LibraryEntry> ListLibrary()
+{
+    g_librarySlugs.clear();
+    std::vector<OverlayUI::LibraryEntry> entries;
+    for (const LibraryConsole &console : kLibraryConsoles)
+    {
+        std::vector<std::string> roms;
+        for (const std::string &folder : RomFoldersFor(console.slug))
+            ScanRomFolder(folder, 2, roms);
+        std::sort(roms.begin(), roms.end());
+        roms.erase(std::unique(roms.begin(), roms.end()), roms.end());
+
+        std::string detail = console.slug;
+        std::transform(detail.begin(), detail.end(), detail.begin(),
+                       [](unsigned char c) { return (char)std::toupper(c); });
+        for (const std::string &path : roms)
+        {
+            if (!g_librarySlugs.emplace(path, console.slug).second)
+                continue; // listed under the first console that has it
+            const std::string filename = path.substr(path.find_last_of('/') + 1);
+            std::string title = TicoUtils::GetCleanTitle(filename);
+            if (title.empty())
+                title = filename;
+            entries.push_back({title, detail, path});
+        }
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
+        return strcasecmp(a.title.c_str(), b.title.c_str()) < 0;
+    });
+    return entries;
+}
+
+static std::string LibrarySlugFor(const std::string &path)
+{
+    const auto it = g_librarySlugs.find(path);
+    return it != g_librarySlugs.end() ? it->second : SlugForRom(path);
+}
+
+static void RegisterLibrary()
+{
+    OverlayUI::LibraryCallbacks library;
+    library.list = [] { return ListLibrary(); };
+    library.launch = [](const std::string &path) { g_pendingLaunch = path; };
+    OverlayUI::SetLibraryCallbacks(std::move(library));
+
+    OverlayUI::LibraryFolderCallbacks folders;
+    folders.groups = [] {
+        std::vector<OverlayUI::LibraryFolderGroup> groups;
+        const std::vector<std::string> bases = TicoRomBases();
+        for (const LibraryConsole &console : kLibraryConsoles)
+        {
+            OverlayUI::LibraryFolderGroup group;
+            group.label = console.title;
+            for (const std::string &base : bases)
+                group.bases.push_back(base + console.slug + "/");
+            group.folders = ModuleRomFolders(console.slug);
+            groups.push_back(std::move(group));
+        }
+        return groups;
+    };
+    folders.set = [](int group, const std::vector<std::string> &paths) {
+        if (group >= 0 && group < (int)(sizeof(kLibraryConsoles) / sizeof(kLibraryConsoles[0])))
+        {
+            std::vector<std::string> normalized;
+            for (const std::string &path : paths)
+                normalized.push_back(WithSlash(path));
+            SetModuleRomFolders(kLibraryConsoles[group].slug, normalized);
+        }
+    };
+    OverlayUI::SetLibraryFolderCallbacks(std::move(folders));
+}
+
+// Creates the core for a game and loads it. The console picks the save and
+// state folders, so it is set before the core, which reads them when created.
+static void StartGame(const std::string &slug, const std::string &romPath, const std::string &titleArg)
+{
+    TicoConfig::SetSlug(slug);
+    LOG_INFO("HOME", "Console slug: %s, ROM: %s", slug.c_str(), romPath.c_str());
+    TicoConfig::MakeDirs(TicoConfig::SavesPath());
+    TicoConfig::MakeDirs(TicoConfig::StatesPath());
+    TicoConfig::MakeDirs(TicoConfig::SystemPath());
+
+    g_core = std::make_unique<TicoCore>();
+    g_core->EnsureConfigLoaded();
+    ApplySettingsToCore();
+    g_core->SetAudioCallbacks(AudioSampleCallback, AudioSampleBatchCallback, AudioFlushCallback);
+    g_core->SetVideoCallback(VideoCallback);
+
+    const size_t lastSlash = romPath.find_last_of("/\\");
+    const std::string filename = lastSlash != std::string::npos ? romPath.substr(lastSlash + 1) : romPath;
+    // Prefer the launcher-supplied title; fall back to the rom filename.
+    std::string cleanTitle = titleArg.empty() ? TicoUtils::GetCleanTitle(filename) : titleArg;
+    if (cleanTitle.empty())
+        cleanTitle = filename;
+    OverlayUI::SetGameTitle(cleanTitle);
+    OverlayUI::SetLibraryMode(false);
+
+    if (!g_core->LoadGame(romPath))
+    {
+        LOG_ERROR("HOME", "Failed to load ROM: %s", romPath.c_str());
+        if (g_standalone)
+        {
+            ShowLibrary();
+            OverlayUI::ShowToast(SwitchFrontend::OverlayTranslation::tr("emulator_load_game_failed"),
+                                 OverlayUI::ToastCorner::TopRight);
+        }
+        return;
+    }
+    g_pacedFps = 0.0; // UpdateFramePacing sets the audio rate for this game
+}
+
+// Back to the library: the core unloads (saving the game and its clock).
+static void ShowLibrary()
+{
+    if (g_core)
+    {
+        TicoVulkan::WaitIdle();
+        g_core.reset();
+    }
+    StopFastForward();
+    OverlayUI::SetGameTitle("Snes9x");
+    OverlayUI::SetLibraryMode(true);
+    if (g_menuOpen)
+        CloseMenu();
+    OpenMenu();
+}
+
+void HandleInput()
+{
+    SDL_GameController *controllers[4] = {nullptr, nullptr, nullptr, nullptr};
+    int numControllers = 0;
+
+    if (g_controllersDirty)
+    {
+        RefreshControllers();
+    }
+
+    for (int i = 0; i < 4; ++i)
+    {
+        if (g_controllers[i])
+            controllers[numControllers++] = g_controllers[i];
+    }
+
+    RunMenuAction();
+    if (!g_running)
+        return;
+
+    if (!g_pendingLaunch.empty())
+    {
+        const std::string path = g_pendingLaunch;
+        g_pendingLaunch.clear();
+        CloseMenu();
+        StartGame(LibrarySlugFor(path), path, std::string());
+        return;
+    }
+
+    SDL_GameController *pad = numControllers > 0 ? controllers[0] : nullptr;
+    if (pad && g_overlayReady)
+    {
+        // Guide, or Plus+Minus, opens the menu and closes it again.
+        const bool start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
+        const bool select = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
+        const bool guide = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_GUIDE);
+        const bool toggle = guide || (start && select);
+        // the library stays open while no game runs
+        if (toggle && !g_toggleHeld && g_core)
+        {
+            if (g_menuOpen)
+                CloseMenu();
+            else
+                OpenMenu();
+        }
+        g_toggleHeld = toggle;
+        if (toggle && g_core)
+        {
+            g_core->ClearInputs();
+            return;
+        }
+    }
+    if (g_menuOpen)
+    {
+        if (pad)
+            FeedMenu(pad);
+        return;
+    }
+
+    if (g_core)
+    {
+        g_core->ClearInputs();
+
+        // Player 1's fast-forward hotkey: its Switch button is not mapped.
+        const uint32_t ffButton = UpdateFastForward(numControllers > 0 ? controllers[0] : nullptr);
+        const bool analogDpad = OverlayConfig::GetConfigValue("analog_dpad", "enabled") != "disabled";
+
+        for (int p = 0; p < numControllers; p++)
+        {
+            SDL_GameController *controller = controllers[p];
+            if (!controller) continue;
+
+            uint32_t held = SwitchButtonsHeld(controller);
+            if (p == 0)
+                held &= ~ffButton;
+            if (analogDpad)
+            {
+                const int16_t leftX = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
+                const int16_t leftY = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
+                if (leftY < -16000) held |= SwitchBit(SwitchButton::Up);
+                if (leftY > 16000) held |= SwitchBit(SwitchButton::Down);
+                if (leftX < -16000) held |= SwitchBit(SwitchButton::Left);
+                if (leftX > 16000) held |= SwitchBit(SwitchButton::Right);
+            }
+
+            // Controls > Button mapping: each SNES button on its Switch button.
+            for (const ButtonMapping &mapping : kButtonMappings)
+            {
+                const uint32_t bit =
+                    SwitchBitFor(OverlayConfig::GetConfigValue(mapping.key, mapping.fallback));
+                g_core->SetInputState(p, mapping.retroId, (held & bit) != 0);
+            }
+        }
+    }
 }
 
 void Render()
@@ -672,80 +1541,29 @@ void Render()
     GetDisplayResolution(w, h);
     ImVec2 displaySize((float)w, (float)h);
 
-    if (g_core)
+    if (g_core && !g_menuOpen)
     {
-        bool overlayVisible = g_overlay && g_overlay->IsVisible();
-
-        if (!overlayVisible)
+        if (frameCount <= 3)
+            LOG_DEBUG("RENDER", "Frame %d: Calling RunFrame", frameCount);
+        UpdateFramePacing();
+        g_frameAccum += g_frameStep * FramesThisRefresh();
+        while (g_frameAccum >= 1.0)
         {
-            if (frameCount <= 3)
-            {
-                LOG_DEBUG("RENDER", "Frame %d: Calling RunFrame", frameCount);
-            }
-            UpdateFramePacing();
-            g_frameAccum += g_frameStep;
-            while (g_frameAccum >= 1.0)
-            {
-                g_frameAccum -= 1.0;
-                g_core->RunFrame();
-            }
-            if (frameCount <= 3)
-            {
-                LOG_DEBUG("RENDER", "Frame %d: RunFrame returned", frameCount);
-            }
+            g_frameAccum -= 1.0;
+            g_core->RunFrame();
         }
     }
-
-    if (g_overlay)
+    else if (g_core)
     {
-        // Apply a shader change made in the overlay.
-        std::string wanted = g_overlay->GetShaderPreset();
-#ifndef __SWITCH__
-        if (const char *forced = getenv("TICO_SHADER"))
-            wanted = forced;
-#endif
-        if (g_chain && wanted != g_activePreset)
-        {
-            // Compiling a preset can take a while on the Switch, so the frame
-            // before it shows a message instead of the screen just freezing.
-            static std::string announced;
-            if (announced != wanted && !wanted.empty() && g_core)
-            {
-                announced = wanted;
-                g_core->ShowOSD(tr("emulator_loading_shader"), 2);
-            }
-            else
-            {
-                announced.clear();
-                std::string error;
-                if (g_chain->LoadPreset(wanted, error))
-                {
-                    g_activePreset = wanted;
-                    g_overlay->OnShaderLoaded();
-                }
-                else
-                {
-                    LOG_ERROR("SHADER", "Cannot load %s: %s", wanted.c_str(), error.c_str());
-                    std::string firstLine = error.substr(0, error.find('\n'));
-                    if (g_core)
-                        g_core->ShowOSD(tr("emulator_shader_failed") + ": " + firstLine.substr(0, 80), 300);
-                    // Keep showing (and saving) what actually runs.
-                    g_overlay->SetShaderPreset(g_activePreset == "\x01" ? "" : g_activePreset);
-                    if (g_activePreset == "\x01")
-                        g_activePreset.clear();
-                }
-            }
-        }
-
-        float ar = g_core ? g_core->GetAspectRatio() : 4.0f / 3.0f;
-        ImVec4 rect = g_overlay->ComputeGameRect(displaySize, ar);
-        ImTextureID tex = ImTextureID_Invalid;
-        if (g_chain && cmd && rect.z >= 1.0f && rect.w >= 1.0f)
-            tex = g_chain->Process(cmd, (uint32_t)rect.z, (uint32_t)rect.w, ar,
-                                   g_core ? g_core->GetFPS() : 60.0);
-        g_overlay->Render(displaySize, tex, rect);
+        // paused in the menu: keep the RetroAchievements session alive
+        g_core->Idle();
     }
-    
+
+    ApplyShaderPreset();
+    DrawGame(cmd, ImGui::GetBackgroundDrawList(), displaySize);
+    UpdateHud(ImGui::GetIO().DeltaTime);
+    ImGuiOverlay::Draw(g_core.get(), displaySize.x, displaySize.y, ImGui::GetIO().DeltaTime);
+
     if (g_core && g_core->GetOSDFrames() > 0)
     {
         ImDrawList *fg = ImGui::GetForegroundDrawList();
@@ -779,28 +1597,6 @@ void Render()
     ImGui::Render();
     if (cmd)
         TicoVulkan::EndFrame(ImGui::GetDrawData());
-
-#ifndef __SWITCH__
-    // Debug: TICO_SCREENSHOT_FRAME=N saves frame N, overlay included, to
-    // TICO_SCREENSHOT_PATH (captured by the next EndFrame).
-    static const char *shotFrame = getenv("TICO_SCREENSHOT_FRAME");
-    if (shotFrame && frameCount + 1 == atoi(shotFrame))
-    {
-        const char *path = getenv("TICO_SCREENSHOT_PATH");
-        TicoVulkan::RequestScreenshot(path ? path : "tico-screenshot.png");
-    }
-
-    // Debug hook for testing shaders on the desktop: TICO_DUMP_FRAME=N saves
-    // the shader chain's output after N frames to TICO_DUMP_PATH and quits.
-    static const char *dumpFrame = getenv("TICO_DUMP_FRAME");
-    if (dumpFrame && g_chain && frameCount == atoi(dumpFrame))
-    {
-        const char *path = getenv("TICO_DUMP_PATH");
-        bool ok = g_chain->SaveOutputPNG(path ? path : "tico-frame.png");
-        LOG_INFO("RENDER", "Frame dump %s", ok ? "written" : "failed");
-        g_running = false;
-    }
-#endif
 }
 
 //==============================================================================
@@ -813,8 +1609,6 @@ int main(int argc, char *argv[])
 
     g_running = true;
     g_controllersDirty = true;
-
-
 
 #ifdef __SWITCH__
     LOG_INFO("HOME", "Calling appletLockExit...");
@@ -830,24 +1624,21 @@ int main(int argc, char *argv[])
         LOG_INFO("HOME", "romfsInit succeeded");
     }
 
+    LOG_INFO("HOME", "Calling nwindowSetDimensions...");
+    nwindowSetDimensions(nwindowGetDefault(), 1920, 1080);
+    LOG_INFO("HOME", "Switch pre-init complete (romfs, nwindow)");
+
     if (R_SUCCEEDED(socketInitializeDefault()))
     {
         LOG_INFO("HOME", "socketInitializeDefault succeeded");
-        curl_global_init(CURL_GLOBAL_DEFAULT);
     }
     else
     {
         LOG_ERROR("HOME", "socketInitializeDefault failed");
     }
-
-    LOG_INFO("HOME", "Calling nwindowSetDimensions...");
-    nwindowSetDimensions(nwindowGetDefault(), 1920, 1080);
-    LOG_INFO("HOME", "Switch pre-init complete (romfs, nwindow)");
 #endif
 
-    LOG_INFO("HOME", "snes9x starting...");
-
-    TicoTranslationManager::Instance().Init();
+    LOG_INFO("HOME", "snes9x starting (slug: %s)...", TicoConfig::CURRENT_SLUG.c_str());
 
     LOG_INFO("HOME", "Calling InitWindow...");
     if (!InitWindow())
@@ -883,61 +1674,45 @@ int main(int argc, char *argv[])
     g_lastOperationMode = 255;
 #endif
 
-    LOG_INFO("HOME", "Creating core...");
-    g_core = std::make_unique<TicoCore>();
-
-    LOG_INFO("HOME", "Creating overlay...");
-    g_overlay = std::make_unique<TicoOverlay>();
-    g_overlay->SetCore(g_core.get());
-    g_overlay->SetShaderChain(g_chain.get());
-
-    g_core->SetAudioCallbacks(AudioSampleCallback, AudioSampleBatchCallback, AudioFlushCallback);
-    g_core->SetVideoCallback(VideoCallback);
+    OverlayConfig::ReloadConfig();
+    MigrateShaderSetting();
 
     if (!g_audio.Init(g_audioDevice))
     {
         LOG_WARN("HOME", "TicoAudio init failed");
     }
 
-    LOG_INFO("HOME", "Core and overlay created");
+    g_overlayReady = ImGuiOverlay::Init();
+    OverlayUI::SetSlotOccupiedCallback([](int slot) {
+        struct stat st;
+        return g_core && slot >= 1 && stat(StatePath(slot - 1).c_str(), &st) == 0;
+    });
+    RegisterShaderMenu();
+    OverlayUI::ReloadSettings();
 
-    std::string romPath = TicoConfig::TEST_ROM;
-    bool romArgFound = false;
-
-    if (argc > 1 && argv[1])
+    // tico launches with argv[1] = console slug, argv[2] = ROM path,
+    // argv[3] = title. Without a ROM (e.g. from the homebrew menu) the library
+    // lists the ROM folders instead.
+    if (argc >= 3 && strchr(argv[1], '/'))
     {
-        romPath = argv[1];
-        romArgFound = true;
-        LOG_INFO("HOME", "ROM path provided via argv: %s", romPath.c_str());
+        // tico before {slug} in the launch line: argv[1] = ROM, argv[2] = title
+        StartGame(SlugForRom(argv[1]), argv[1], argv[2] ? argv[2] : "");
     }
-
-    if (!romArgFound)
+    else if (argc >= 3)
     {
-        LOG_INFO("HOME", "No ROM argument provided. Using default: %s", romPath.c_str());
+        StartGame(argv[1], argv[2], argc >= 4 && argv[3] ? argv[3] : "");
     }
-
+    else if (argc == 2)
     {
-        size_t lastSlash = romPath.find_last_of("/\\");
-        std::string filename = (lastSlash != std::string::npos) ? romPath.substr(lastSlash + 1) : romPath;
-
-        std::string cleanTitle = TicoUtils::GetCleanTitle(filename);
-        if (cleanTitle.empty())
-            cleanTitle = filename;
-
-        g_overlay->SetGameTitle(cleanTitle);
-    }
-
-    LOG_INFO("HOME", "Loading ROM: %s", romPath.c_str());
-    if (!g_core->LoadGame(romPath))
-    {
-        LOG_ERROR("HOME", "Failed to load ROM: %s", romPath.c_str());
+        // a single argument is the ROM path
+        StartGame(SlugForRom(argv[1]), argv[1], std::string());
     }
     else
     {
-        UpdateFramePacing();
+        g_standalone = true;
+        RegisterLibrary();
+        ShowLibrary();
     }
-
-    Uint32 lastTime = SDL_GetTicks();
 
     // Frame pacing is handled entirely by vsync (FIFO presentation). Audio is
     // non-blocking, so presentation is the only governor. While fast-forwarding
@@ -955,19 +1730,11 @@ int main(int argc, char *argv[])
         }
 #endif
 
-        bool fastForward = g_audio.IsFastForwarding();
+        bool fastForward = FastForwardUncapped();
         if (fastForward != lastFastForward)
         {
             TicoVulkan::SetVsync(!fastForward);
             lastFastForward = fastForward;
-        }
-
-        float deltaTime = (SDL_GetTicks() - lastTime) / 1000.0f;
-        lastTime = SDL_GetTicks();
-
-        if (g_overlay)
-        {
-            g_overlay->Update(deltaTime);
         }
 
         ProcessEvents();
@@ -977,7 +1744,11 @@ int main(int argc, char *argv[])
 
     LOG_INFO("HOME", "Starting cleanup...");
     TicoVulkan::WaitIdle();
-    g_overlay.reset();
+    OverlayUI::SetSlotOccupiedCallback(nullptr);
+    OverlayUI::SetShaderCallbacks({});
+    OverlayUI::SetLibraryCallbacks({});
+    OverlayUI::SetLibraryFolderCallbacks({});
+    ImGuiOverlay::Shutdown();
     g_core.reset();
 
 
@@ -991,26 +1762,13 @@ int main(int argc, char *argv[])
     CleanupWindow();
 
 #ifdef __SWITCH__
-    romfsExit();
-    curl_global_cleanup();
     socketExit();
+    romfsExit();
     appletUnlockExit();
 #endif
 
     LOG_INFO("HOME", "Clean exit");
     Logger::Instance().CloseLogFile();
 
-    // For exit-to-system: exit(0) triggers libnx's __libnx_exit() which calls
-    // __appExit() (tears down fsdev, fs, time, hid, applet, sm) and then
-    // __nx_exit(0, envGetExitFuncPtr()).
-    // Normally, Homebrew apps return to their loader (Sphaira/hbmenu) rather than exiting to OS.
-    // By setting __nx_applet_exit_mode = 1, we bypass the loader and tell Switch OS to terminate the applet.
-#ifdef __SWITCH__
-    if (g_exitToSystem)
-    {
-        LOG_INFO("HOME", "g_exitToSystem is true, forcing applet termination via __nx_applet_exit_mode");
-        __nx_applet_exit_mode = 1;
-    }
-#endif
     exit(0);
 }
