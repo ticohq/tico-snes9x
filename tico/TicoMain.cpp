@@ -203,6 +203,60 @@ static void RefreshControllers()
     g_controllersDirty = false;
 }
 
+// Settings > Players: what each player has. SDL lists the connected pads in
+// slot order (the handheld Joy-Con with the first), and that is the order the
+// players take, so the names follow it.
+static std::vector<std::string> ControllerNames()
+{
+    std::vector<std::string> names;
+#ifdef __SWITCH__
+    auto name = [](u32 style) -> std::string {
+        const char *key = "emulator_pad_other";
+        if (style & HidNpadStyleTag_NpadFullKey)
+            key = "emulator_pad_pro";
+        else if (style & HidNpadStyleTag_NpadHandheld)
+            key = "emulator_pad_handheld";
+        else if (style & HidNpadStyleTag_NpadJoyDual)
+            key = "emulator_pad_joycon_pair";
+        else if (style & HidNpadStyleTag_NpadJoyLeft)
+            key = "emulator_pad_joycon_left";
+        else if (style & HidNpadStyleTag_NpadJoyRight)
+            key = "emulator_pad_joycon_right";
+        else if (style & HidNpadStyleTag_NpadGc)
+            key = "emulator_pad_gamecube";
+        return SwitchFrontend::OverlayTranslation::tr(key);
+    };
+    const u32 handheld = hidGetNpadStyleSet(HidNpadIdType_Handheld);
+    for (int slot = 0; slot < 8 && names.size() < 4; ++slot)
+    {
+        u32 style = hidGetNpadStyleSet(static_cast<HidNpadIdType>(HidNpadIdType_No1 + slot));
+        if (slot == 0 && !style)
+            style = handheld;
+        if (style)
+            names.push_back(name(style));
+    }
+    if (names.empty() && handheld)
+        names.push_back(name(handheld));
+#endif
+    names.resize(4);
+    return names;
+}
+
+// The system's controller screen, where the players choose who is which.
+static bool ShowControllerOrder()
+{
+#ifdef __SWITCH__
+    HidLaControllerSupportArg arg;
+    hidLaCreateControllerSupportArg(&arg);
+    arg.hdr.player_count_min = 0;
+    arg.hdr.player_count_max = 4;
+    HidLaControllerSupportResultInfo info{};
+    return R_SUCCEEDED(hidLaShowControllerSupport(&info, &arg));
+#else
+    return false;
+#endif
+}
+
 static void GetDisplayResolution(int &w, int &h)
 {
 #ifdef __SWITCH__
@@ -1011,6 +1065,12 @@ static void RunMenuAction()
         ChainloadTico();
         g_running = false;
         return;
+    case Action::ControllerOrder:
+        if (!ShowControllerOrder())
+            OverlayUI::ShowToast(SwitchFrontend::OverlayTranslation::tr("emulator_controllers_failed"),
+                                 OverlayUI::ToastCorner::TopRight);
+        g_controllersDirty = true; // the players may be in another order now
+        return;
     case Action::Reset:
         if (g_core)
             g_core->Reset();
@@ -1557,6 +1617,8 @@ static void StartGame(const std::string &slug, const std::string &romArg, const 
     TicoConfig::MakeDirs(TicoConfig::StatesPath());
     TicoConfig::MakeDirs(TicoConfig::SystemPath());
 
+    // this game's own settings (Settings > This Game), if it has them, over the core's
+    OverlayConfig::SetGame(romPath);
     g_core = std::make_unique<TicoCore>();
     g_core->EnsureConfigLoaded();
     ApplySettingsToCore();
@@ -1598,6 +1660,7 @@ static void ShowLibrary()
     }
     StopFastForward();
     OverlayUI::SetGameTitle("Snes9x");
+    OverlayConfig::SetGame(std::string()); // the library has no game settings
     OverlayUI::SetLibraryMode(true);
     if (g_menuOpen)
         CloseMenu();
@@ -1914,6 +1977,10 @@ int main(int argc, char *argv[])
         return preview;
     });
     // Cheats from the game's .cht/.cheats file; the menu hides them in hardcore.
+    // Settings > Players: who is which player, and the system's screen to change it
+    OverlayUI::PlayerCallbacks players;
+    players.ports = [] { return ControllerNames(); };
+    OverlayUI::SetPlayerCallbacks(std::move(players));
     OverlayUI::SetCheatCallbacks(
         [] {
             std::vector<OverlayUI::CheatMenuEntry> entries;
@@ -1994,6 +2061,7 @@ int main(int argc, char *argv[])
     TicoVulkan::WaitIdle();
     OverlayUI::SetSlotOccupiedCallback(nullptr);
     OverlayUI::SetCheatCallbacks(nullptr, nullptr);
+    OverlayUI::SetPlayerCallbacks({});
     OverlayUI::SetSlotPreviewCallback(nullptr);
     OverlayUI::SetShaderCallbacks({});
     OverlayUI::SetLibraryCallbacks({});
