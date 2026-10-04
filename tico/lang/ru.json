@@ -129,5 +129,6 @@
     "settings_snes9x_value_top_left": "Сверху слева",
     "settings_snes9x_value_top_right": "Сверху справа",
     "settings_snes9x_value_unlimited": "Без ограничений",
-    "settings_snes9x_value_up": "Вверх"
+    "settings_snes9x_value_up": "Вверх",
+    "emulator_sd_card": "SD-карта"
 }

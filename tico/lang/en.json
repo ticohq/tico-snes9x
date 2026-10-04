@@ -120,5 +120,6 @@
     "settings_snes9x_tab_hacks": "Hacks",
     "settings_snes9x_tab_system": "System",
     "settings_snes9x_tab_video": "Video",
-    "settings_snes9x_transparency_effects": "Transparency Effects"
+    "settings_snes9x_transparency_effects": "Transparency Effects",
+    "emulator_sd_card": "SD card"
 }
