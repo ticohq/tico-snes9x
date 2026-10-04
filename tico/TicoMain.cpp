@@ -73,6 +73,9 @@ static std::unique_ptr<TicoCore> g_core;
 static bool g_standalone = false;
 static std::string g_pendingLaunch;
 static void ShowLibrary();
+static void StartGame(const std::string &slug, const std::string &romArg, const std::string &titleArg);
+// the title the running game was started with, for Restart
+static std::string g_titleArg;
 
 // Quick menu
 static bool g_menuOpen = false;
@@ -975,6 +978,22 @@ static void RunMenuAction()
             g_core->Reset();
         CloseMenu();
         return;
+    case Action::Restart:
+        // Load the game again from disk, as if it were started anew: the core
+        // unloads first (saving the game), so two never run at once.
+        if (g_core)
+        {
+            const std::string path = g_core->GetGamePath();
+            const std::string slug = TicoConfig::CURRENT_SLUG;
+            const std::string title = g_titleArg;
+            CloseMenu();
+            TicoVulkan::WaitIdle();
+            g_core.reset();
+            StopFastForward();
+            AudioFlushCallback(); // nothing of the old session plays into the new one
+            StartGame(slug, path, title);
+        }
+        return;
     default:
         break;
     }
@@ -1489,6 +1508,7 @@ static void StartGame(const std::string &slug, const std::string &romArg, const 
         romPath = romArg;
     }
     TicoConfig::SetSlug(slug);
+    g_titleArg = titleArg;
     LOG_INFO("HOME", "Console slug: %s, ROM: %s", slug.c_str(), romPath.c_str());
     TicoConfig::MakeDirs(TicoConfig::SavesPath());
     TicoConfig::MakeDirs(TicoConfig::StatesPath());
@@ -1820,7 +1840,7 @@ int main(int argc, char *argv[])
 
     g_overlayReady = ImGuiOverlay::Init();
     // Save/Load State show each slot's picture and when it was saved.
-    static std::array<ImTextureID, 4> slotPictures{};
+    static std::array<ImTextureID, 6> slotPictures{};
     OverlayUI::SetSlotPreviewCallback([](int slot) {
         OverlayUI::SlotPreview preview;
         if (slot < 1 || slot > (int)slotPictures.size() || !g_core)
@@ -1846,6 +1866,23 @@ int main(int argc, char *argv[])
             preview.aspect = g_core->GetAspectRatio();
         return preview;
     });
+    // Cheats from the game's .cht/.cheats file; the menu hides them in hardcore.
+    OverlayUI::SetCheatCallbacks(
+        [] {
+            std::vector<OverlayUI::CheatMenuEntry> entries;
+            if (!g_core)
+                return entries;
+            const auto &cheats = g_core->GetCheats();
+            for (size_t i = 0; i < cheats.size(); ++i)
+                entries.push_back({cheats[i].name, cheats[i].enabled, true, (int)i, false});
+            return entries;
+        },
+        [](int index) {
+            if (!g_core || index < 0)
+                return false;
+            g_core->ToggleCheat((size_t)index);
+            return true;
+        });
     OverlayUI::SetSlotOccupiedCallback([](int slot) {
         struct stat st;
         return g_core && slot >= 1 && stat(StatePath(slot - 1).c_str(), &st) == 0;
@@ -1908,6 +1945,7 @@ int main(int argc, char *argv[])
     LOG_INFO("HOME", "Starting cleanup...");
     TicoVulkan::WaitIdle();
     OverlayUI::SetSlotOccupiedCallback(nullptr);
+    OverlayUI::SetCheatCallbacks(nullptr, nullptr);
     OverlayUI::SetSlotPreviewCallback(nullptr);
     OverlayUI::SetShaderCallbacks({});
     OverlayUI::SetLibraryCallbacks({});
