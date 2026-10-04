@@ -143,5 +143,6 @@
     "settings_snes9x_value_top_right": "右上",
     "settings_snes9x_value_unlimited": "无限制",
     "settings_snes9x_value_up": "上",
-    "emulator_sd_card": "SD卡"
+    "emulator_sd_card": "SD卡",
+    "emulator_no_preview": "无预览"
 }

@@ -121,5 +121,6 @@
     "settings_snes9x_tab_system": "System",
     "settings_snes9x_tab_video": "Video",
     "settings_snes9x_transparency_effects": "Transparency Effects",
-    "emulator_sd_card": "SD card"
+    "emulator_sd_card": "SD card",
+    "emulator_no_preview": "No preview"
 }
