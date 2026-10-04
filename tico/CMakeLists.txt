@@ -23,6 +23,7 @@ add_subdirectory(${DEPS}/glslang glslang EXCLUDE_FROM_ALL)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2 SDL2_mixer)
 find_package(CURL REQUIRED)
+find_package(LibArchive REQUIRED)
 
 file(GLOB RCHEEVOS_SOURCES ${ROOT}/rcheevos/src/*.c ${ROOT}/rcheevos/src/*/*.c)
 list(FILTER RCHEEVOS_SOURCES EXCLUDE REGEX "rc_client_external\\.c$")
@@ -42,8 +43,9 @@ target_include_directories(rcheevos PUBLIC ${ROOT}/rcheevos/include PRIVATE ${RO
 target_compile_definitions(rcheevos PUBLIC RC_CLIENT_SUPPORTS_HASH)
 
 add_executable(tico-snes9x
-    TicoMain.cpp TicoCore.cpp TicoOverlay.cpp TicoTranslationManager.cpp
-    TicoVulkan.cpp TicoShaderChain.cpp TicoSlang.cpp
+    TicoMain.cpp TicoCore.cpp TicoVulkan.cpp TicoShaderChain.cpp TicoSlang.cpp
+    overlay/imgui_overlay.cpp overlay/overlay_ui.cpp overlay/ra_alerts.cpp
+    overlay/tico_config.cpp overlay/translation_manager.cpp
     ${DEPS}/volk/volk.c
     ${DEPS}/SPIRV-Reflect/spirv_reflect.c
     ${DEPS}/imgui/imgui.cpp ${DEPS}/imgui/imgui_draw.cpp ${DEPS}/imgui/imgui_tables.cpp
@@ -54,10 +56,10 @@ target_include_directories(tico-snes9x PRIVATE
     ${DEPS}/volk ${DEPS}/vulkan-headers ${DEPS}/glslang ${DEPS}/SPIRV-Reflect
     ${ROOT}/libretro)
 target_compile_definitions(tico-snes9x PRIVATE
-    IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES)
+    IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES TICO_APP_VERSION="desktop")
 target_link_libraries(tico-snes9x PRIVATE
     ${SNES9X_CORE_LIB} lrc rcheevos glslang glslang-default-resource-limits
-    PkgConfig::SDL2 CURL::libcurl ${CMAKE_DL_LIBS} pthread)
+    PkgConfig::SDL2 CURL::libcurl LibArchive::LibArchive ${CMAKE_DL_LIBS} pthread)
 
 # Headless preset runner: tools/shader_test.cpp
 add_executable(shader_test

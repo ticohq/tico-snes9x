@@ -2,7 +2,7 @@
   "id": "snes9x",
   "name": "Snes9x",
   "nro": "tico-snes9x.nro",
-  "launch": "\"{nro}\" \"{rom}\" \"{title}\"",
+  "launch": "\"{nro}\" \"{slug}\" \"{rom}\" \"{title}\"",
   "settings": "config/modules/snes9x/settings.json",
   "config_file": "snes9x.jsonc",
   "is_libretro": true,
@@ -17,7 +17,10 @@
         ".fig",
         ".swc",
         ".bs",
-        ".st"
+        ".st",
+        ".zip",
+        ".7z",
+        ".rar"
       ],
       "games_file": "snes.json",
       "retroachievements_id": 3,

@@ -8,16 +8,31 @@ namespace TicoConfig {
     constexpr const char* TEST_ROM = "sdmc:/tico/roms/snes/rom.sfc";
 
     constexpr const char* FONT_PATH = "romfs:/fonts/font.ttf";
-    /// Content directories for this console. Tico's per-module Paths tab stores
-    /// custom roots as tico_{system,saves,states}_path in snes9x.jsonc; like
-    /// Tico's own {saves}/{states}/{system}, the console slug is appended to the
-    /// root. Empty or missing keys fall back to sdmc:/tico/<kind>/snes/.
+
+    // Current console slug (snes, from argv[1])
+    inline std::string CURRENT_SLUG = "snes";
+
+    /// @brief Set the console being booted (snes)
+    inline void SetSlug(const std::string& slug) {
+        if (!slug.empty())
+            CURRENT_SLUG = slug;
+    }
+
+    /// Content directories, with a trailing slash. Tico's per-module Paths tab
+    /// stores custom roots as tico_{system,saves,states}_path in snes9x.jsonc;
+    /// empty or missing keys fall back to sdmc:/tico/<kind>/. Like tico's own
+    /// {saves}/{states}/{system}, the console slug is appended to the root.
     std::string SystemPath();
     std::string SavesPath();
     std::string StatesPath();
 
     /// Create a directory and any missing parents.
-    void MakeDirs(const std::string &path);
+    void MakeDirs(const std::string& path);
+
+    /// @brief Map console slug to RetroAchievements console ID
+    inline int GetRcConsoleId() {
+        return 3; // RC_CONSOLE_SUPER_NINTENDO
+    }
 
     constexpr int WINDOW_WIDTH = 1280;
     constexpr int WINDOW_HEIGHT = 720;
