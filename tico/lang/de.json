@@ -130,5 +130,6 @@
     "settings_snes9x_value_top_right": "Oben rechts",
     "settings_snes9x_value_unlimited": "Unbegrenzt",
     "settings_snes9x_value_up": "Oben",
-    "emulator_sd_card": "SD-Karte"
+    "emulator_sd_card": "SD-Karte",
+    "emulator_no_preview": "Keine Vorschau"
 }
