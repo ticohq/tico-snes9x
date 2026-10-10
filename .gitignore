@@ -515,3 +515,6 @@ tico/config/
 
 # prebuilt libusbhsfs + read-only NTFS (usbntfs), see tico/deps/usbhsfs
 !tico/deps/usbhsfs/lib/*.a
+
+# TicoSecure build secret (shared with tico)
+/tico/TicoSecret.h
