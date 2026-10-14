@@ -5,6 +5,7 @@
   "launch": "\"{nro}\" \"{slug}\" \"{rom}\" \"{title}\"",
   "settings": "config/modules/snes9x/settings.json",
   "config_file": "snes9x.jsonc",
+  "system_dir": "snes9x",
   "is_libretro": true,
   "achievements": true,
   "systems": [
