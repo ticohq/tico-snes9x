@@ -24,7 +24,7 @@
         ".7z",
         ".rar"
       ],
-      "games_file": "snes.json",
+      "games_file": "snes.dat",
       "retroachievements_id": 3,
       "colors": {
         "start": "E65FA0",
