@@ -177,5 +177,6 @@
     "emulator_pad_joycon_left": "Joy-Con (L)",
     "emulator_pad_joycon_right": "Joy-Con (R)",
     "emulator_pad_gamecube": "ゲームキューブコントローラー",
-    "emulator_pad_other": "コントローラー"
+    "emulator_pad_other": "コントローラー",
+    "emulator_quick_menu_tip": "{plus}と{minus}を同時に押すとクイックメニューが開きます"
 }
