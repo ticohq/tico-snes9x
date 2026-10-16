@@ -26,6 +26,17 @@ It adds:
 
 ----------
 
+## Credits
+
+This fork is built on top of the libretro port of Snes9x.
+All core emulation work belongs to the Snes9x team and its contributors.
+
+- **Official Snes9x repository** — https://github.com/snes9xgit/snes9x
+- **Snes9x website** — https://www.snes9x.com
+- **libretro Snes9x** — https://github.com/libretro/snes9x
+
+----------
+
 ## A Note
 
 A lot of work in this scene disappears over time — not because it lacked value, but because it was never shared.
