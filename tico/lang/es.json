@@ -177,5 +177,6 @@
     "emulator_pad_joycon_left": "Joy-Con (I)",
     "emulator_pad_joycon_right": "Joy-Con (D)",
     "emulator_pad_gamecube": "Mando de GameCube",
-    "emulator_pad_other": "Mando"
+    "emulator_pad_other": "Mando",
+    "emulator_quick_menu_tip": "Pulsa {plus} y {minus} a la vez para abrir el menú rápido"
 }

@@ -155,5 +155,6 @@
     "emulator_pad_joycon_left": "Joy-Con (L)",
     "emulator_pad_joycon_right": "Joy-Con (R)",
     "emulator_pad_gamecube": "GameCube controller",
-    "emulator_pad_other": "Controller"
+    "emulator_pad_other": "Controller",
+    "emulator_quick_menu_tip": "Press {plus} and {minus} together to open the quick menu"
 }

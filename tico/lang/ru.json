@@ -164,5 +164,6 @@
     "emulator_pad_joycon_left": "Joy-Con (L)",
     "emulator_pad_joycon_right": "Joy-Con (R)",
     "emulator_pad_gamecube": "Контроллер GameCube",
-    "emulator_pad_other": "Контроллер"
+    "emulator_pad_other": "Контроллер",
+    "emulator_quick_menu_tip": "Нажмите {plus} и {minus} вместе, чтобы открыть быстрое меню"
 }
